@@ -11,6 +11,7 @@
 #include "Verbs.h"
 #include "OssCompat.h"
 #include "AppleALCPinConfigs.h"
+#include "VoodooHDASof.h"
 
 #include "Shared.h"
 
@@ -207,6 +208,7 @@ bool VoodooHDADevice::init(OSDictionary *dict)
 	extern kmod_info_t kmod_info;
 	mVerbose = 0;
 	mFBNotifier = NULL;
+	mSof = NULL;
 	mNumHDMIEngines = 0;
 	bzero(mHDMIEngines, sizeof(mHDMIEngines));
 //	IOLog("VoodooHDA DBG: init() called, dict=%p\n", dict);
@@ -849,6 +851,17 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 	}
 	UNLOCK();
 
+	/* Intel SOF DSP: only after the regular HDA bring-up is complete. A failure here
+	 * never fails VoodooHDA itself. */
+	if (VoodooHDASof::isEnabled(mDeviceId)) {
+		mSof = VoodooHDASof::withDevice(this);
+		if (mSof && !mSof->start()) {
+			errorMsg("VoodooHDA SOF: start failed, continuing without DSP\n");
+			mSof->release();
+			mSof = NULL;
+		}
+	}
+
 	result = true;
 done:
 	if (!result)
@@ -860,6 +873,12 @@ done:
 void VoodooHDADevice::stop(IOService *provider)
 {
 	logMsg("VoodooHDADevice[%p]::stop\n", this);
+
+	if (mSof) {
+		mSof->stop();
+		mSof->release();
+		mSof = NULL;
+	}
 
 	if (mFBNotifier) {
 		mFBNotifier->stopMatching();

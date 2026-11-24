@@ -436,6 +436,9 @@ public:
 	/* Framebuffer notifier for AMD HDMI audio */
 	VoodooHDAFramebufferNotifier *mFBNotifier;
 
+	/* Intel SOF DSP (DMIC) support, only with -voodoosof */
+	class VoodooHDASof *mSof;
+
 	/* Dynamic HDMI engine management */
 	struct HDMIEngineSlot {
 		VoodooHDAEngine *engine;
