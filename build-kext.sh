@@ -13,7 +13,7 @@ OBJ="$OUT/obj"
 KEXT="$OUT/VoodooHDA.kext"
 
 BUNDLE_ID=org.voodoo.driver.VoodooHDA
-KEXT_VERSION="${KEXT_VERSION:-3.6.8d8}"
+KEXT_VERSION="${KEXT_VERSION:-3.6.9d1}"
 MIN_OS=10.13
 
 SDK="${SDK:-$(xcrun --sdk macosx --show-sdk-path)}"
@@ -81,6 +81,33 @@ xcrun clang "${CFLAGS[@]}" -arch x86_64 -isysroot "$SDK" -mmacosx-version-min=$M
   -nostdinc -O0 -c "$OBJ/sof_firmware.c" -o "$OBJ/sof_firmware.o"
 objs+=("$OBJ/sof_firmware.o")
 
+# IPC3 replay list (trace/ipc-replay.json), verified against MANIFEST.sha256
+RJ="$ROOT/../trace/ipc-replay.json"
+want=$(awk '$2=="./trace/ipc-replay.json"{print $1}' "$ROOT/../MANIFEST.sha256")
+have=$(shasum -a 256 "$RJ" | awk '{print $1}')
+[ -n "$want" ] && [ "$want" = "$have" ] || { echo "ipc-replay.json SHA256 mismatch"; exit 1; }
+python3 -I - "$RJ" "$OBJ/sof_replay.cpp" <<'PY'
+import json, sys
+msgs = json.load(open(sys.argv[1]))
+out = ['/* generated from trace/ipc-replay.json */', '#include "VoodooHDASof.h"']
+for i, m in enumerate(msgs):
+    assert m['seq'] == i
+    p = bytes.fromhex(m['payload'])
+    assert len(p) == m['size'] - 8, (i, len(p), m['size'])
+    out.append('static const UInt8 p%d[] = { %s };' % (i, ', '.join('0x%02x' % b for b in p)))
+out.append('extern "C" {')
+out.append('extern __attribute__((visibility("hidden"))) const SofReplayMsg gSofReplay[] = {')
+for i, m in enumerate(msgs):
+    out.append('\t{ %sU, %dU, p%d, "%s" },' % (m['cmd'], m['size'], i, m['type']))
+out.append('};')
+out.append('extern __attribute__((visibility("hidden"))) const unsigned int gSofReplayCount = %d;' % len(msgs))
+out.append('}')
+open(sys.argv[2], 'w').write('\n'.join(out) + '\n')
+PY
+echo "  CC  sof_replay.cpp"
+xcrun clang "${CXXFLAGS[@]}" "${COMMON[@]}" -c "$OBJ/sof_replay.cpp" -o "$OBJ/sof_replay.o"
+objs+=("$OBJ/sof_replay.o")
+
 # kmod_info (what Xcode generates as <product>_info.c)
 cat > "$OBJ/kmod_info.c" <<EOF
 #include <mach/mach_types.h>
@@ -101,6 +128,11 @@ xcrun clang -arch x86_64 -isysroot "$SDK" -mmacosx-version-min=$MIN_OS -flto \
   -nostdlib -Xlinker -kext -Xlinker -no_source_version -Xlinker -dead_strip \
   -L"$SDK/usr/lib" -lkmodc++ "${objs[@]}" "$OBJ/kmod_info.o" -lkmod "$CC_KEXT" \
   -o "$KEXT/Contents/MacOS/VoodooHDA"
+
+# Our own symbols must never be left undefined (kext linking defers them to load time)
+if nm -u "$KEXT/Contents/MacOS/VoodooHDA" | grep -E '_gSof|VoodooHDASof' ; then
+  echo "error: unresolved SOF symbols above"; exit 1
+fi
 
 # Info.plist: substitute Xcode build variables, add the keys Xcode would add
 sed -e "s/\${EXECUTABLE_NAME}/VoodooHDA/; s/\$(PRODUCT_BUNDLE_IDENTIFIER)/$BUNDLE_ID/; s/\${PRODUCT_NAME}/VoodooHDA/" \

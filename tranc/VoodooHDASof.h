@@ -14,7 +14,8 @@
  *   -voodoosofdbg       verbose logging
  *   voodoosofstep=N     stop after milestone step N (default: highest implemented)
  *                       1 = read-only probe, 2 = DSP power-up + ROM init (then power down again),
- *                       3 = full firmware load until FW_READY
+ *                       3 = full firmware load until FW_READY, 4 = + IPC topology replay (and free),
+ *                       5 = + DMIC capture with RMS logging for SOF_DMIC_LOG_SECONDS, then stop
  */
 
 #ifndef _VOODOO_HDA_SOF_H
@@ -22,6 +23,8 @@
 
 #include <libkern/c++/OSObject.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
 
 class VoodooHDADevice;
 class IOPCIDevice;
@@ -127,6 +130,28 @@ struct _DmaMemory;
 #define SOF_IPC_PANIC_MAGIC		0x0dead000U
 #define SOF_IPC_PANIC_MAGIC_MASK	0x0ffff000U
 #define SOF_EXT_MAN_MAGIC		0x6e614d58U	/* "XMan" */
+#define SOF_IPC_MSG_MAX_SIZE		384
+#define SOF_IPC_TIMEOUT_US		500000
+#define SOF_IPC_EXT_WINDOW		1
+#define SOF_IPC_REGION_DOWNBOX		0	/* host -> DSP (host_box) */
+#define SOF_IPC_REGION_UPBOX		1	/* DSP -> host (dsp_box) */
+#define SOF_IPC_REGION_STREAM		4
+#define SOF_SRAM_WINDOW_OFFSET(x)	(0x80000U + (UInt32)(x) * 0x20000U)
+#define SOF_IPC_STREAM_PCM_PARAMS	0x60010000U
+#define SOF_IPC_STREAM_TRIG_START	0x60040000U
+#define SOF_IPC_STREAM_TRIG_STOP	0x60050000U
+#define SOF_IPC_STREAM_PCM_FREE		0x60030000U
+
+/* DMIC capture (from the reference trace: 48 kHz, 2 ch, S16, 64 KB buffer, 4 KB periods) */
+#define SOF_DMIC_BUF_SIZE		0x10000
+#define SOF_DMIC_PERIOD			0x1000
+#define SOF_DMIC_FORMAT			0x0011	/* 48 kHz base, 16 bit, 2 ch */
+#define SOF_DMIC_LOG_SECONDS		300
+/* PCM_PARAMS payload offsets (after the 8-byte sof_ipc_cmd_hdr) */
+#define SOF_PCMP_PHY_ADDR		24
+#define SOF_PCMP_PAGES			28
+#define SOF_PCMP_SIZE			32
+#define SOF_PCMP_STREAM_TAG		64
 
 /* timeouts (hda.h) */
 #define SOF_RESET_TIMEOUT_US		50000
@@ -145,7 +170,17 @@ enum {
 	kSofStepProbe = 1,	/* M1: map BAR4, read-only register dump */
 	kSofStepRom = 2,	/* M2a: core 0 power-up + ROM init, then power down again */
 	kSofStepFw = 3,		/* M2b: code loader DMA, FW_ENTERED, FW_READY */
-	kSofStepMax = kSofStepFw
+	kSofStepIpc = 4,	/* M3a: mailbox windows, replay topology #0-19, free it again #24-31 */
+	kSofStepCapture = 5,	/* M3b: + DMIC host stream, PCM_PARAMS, TRIG_START, RMS log, stop */
+	kSofStepMax = kSofStepCapture
+};
+
+/* IPC3 replay list generated at build time from trace/ipc-replay.json */
+struct SofReplayMsg {
+	UInt32 cmd;
+	UInt32 size;		/* including the 8-byte sof_ipc_cmd_hdr */
+	const UInt8 *payload;	/* size - 8 bytes */
+	const char *name;
 };
 
 struct SofStream {
@@ -195,6 +230,21 @@ private:
 	bool mLinuxIntBits;		/* experiment: SD int enables + BDL IOC exactly like Linux */
 	SofStream mLoader;		/* code loader (playback) */
 	SofStream mIccmax;		/* ICCMAX workaround (capture) */
+
+	/* M3: IPC + DMIC */
+	UInt32 mHostBox, mHostBoxSize;	/* DOWNBOX: host writes requests */
+	UInt32 mDspBox, mDspBoxSize;	/* UPBOX: DSP writes replies/notifications */
+	bool mTopology;			/* replay #1-19 done, needs #24-31 */
+	bool mPcmParams;		/* PCM_PARAMS done, needs PCM_FREE */
+	bool mCapturing;		/* host DMA + TRIG_START done */
+	SofStream mDmic;		/* DMIC host capture stream */
+	struct _DmaMemory *mPageTable;
+	IOWorkLoop *mWorkLoop;
+	IOTimerEventSource *mTimer;
+	UInt32 mTicks;
+	UInt32 mLastLdp;
+	UInt32 mNotifyCount;
+	bool mNsnpFallback;
 
 	bool initWithDevice(VoodooHDADevice *device);
 	bool mapDsp();
@@ -248,6 +298,23 @@ private:
 	void restoreDevc();
 	void abortBoot(const char *why);
 	void powerDownDsp();
+
+	/* M3: IPC3 (cnl.c, hda-ipc.c, ipc3.c) */
+	bool parseExtData();
+	void mboxWrite(UInt32 off, const void *buf, UInt32 len);
+	void mboxRead(UInt32 off, void *buf, UInt32 len);
+	bool ipcTx(UInt32 cmd, const UInt8 *payload, UInt32 size, void *reply, UInt32 replyMax);
+	void serviceNotification();
+	bool replay(int from, int to);
+	bool replayOne(int idx, const UInt8 *payloadOverride = NULL);
+	void teardownTopology();
+
+	/* M3: DMIC capture (hda-pcm.c, hda-stream.c, ipc3-pcm.c, sof-utils.c) */
+	bool dmicStart();
+	void dmicStop();
+	void dmicStreamCleanup();
+	void logCapture();
+	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
 };
 
 #endif /* _VOODOO_HDA_SOF_H */

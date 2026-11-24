@@ -117,7 +117,7 @@ bool VoodooHDASof::initWithDevice(VoodooHDADevice *device)
 	mStep = kSofStepMax;
 	if (PE_parse_boot_argn("voodoosofstep", &val, sizeof val) && val >= 1 && val <= kSofStepMax)
 		mStep = val;
-	mLoader.index = mIccmax.index = -1;
+	mLoader.index = mIccmax.index = mDmic.index = -1;
 	return true;
 }
 
@@ -1080,6 +1080,16 @@ void VoodooHDASof::powerDownDsp()
 {
 	if (!mDsp)
 		return;
+	if (mFwReady && mDspBoxSize) {
+		dmicStop();
+		teardownTopology();
+	} else {
+		dmicStreamCleanup();
+	}
+	if (mNsnpFallback) {
+		mPci->configWrite16(SOF_PCI_DEVC, mSavedDevc);
+		mNsnpFallback = false;
+	}
 	loaderCleanup();
 	iccmaxCleanup();
 	if (mDspPowered || mFwReady) {
@@ -1088,6 +1098,411 @@ void VoodooHDASof::powerDownDsp()
 	}
 	if (mGatingDisabled)
 		clockPowerGating(true);
+}
+
+/* ============================================================================ */
+/* M3: IPC3                                                                     */
+/* ============================================================================ */
+
+extern "C" {
+extern const SofReplayMsg gSofReplay[];
+extern const unsigned int gSofReplayCount;
+}
+
+void VoodooHDASof::mboxWrite(UInt32 off, const void *buf, UInt32 len)
+{
+	const UInt8 *b = (const UInt8 *)buf;
+	for (UInt32 i = 0; i < len; i += 4) {
+		UInt32 w = 0;
+		memcpy(&w, b + i, (len - i) >= 4 ? 4 : len - i);
+		dspW32(off + i, w);
+	}
+}
+
+void VoodooHDASof::mboxRead(UInt32 off, void *buf, UInt32 len)
+{
+	UInt8 *b = (UInt8 *)buf;
+	for (UInt32 i = 0; i < len; i += 4) {
+		UInt32 w = dsp32(off + i);
+		memcpy(b + i, &w, (len - i) >= 4 ? 4 : len - i);
+	}
+}
+
+/* ipc3_fw_parse_ext_data() + ipc3_get_windows(): find host_box / dsp_box */
+bool VoodooHDASof::parseExtData()
+{
+	UInt32 off = SOF_DSP_MBOX_UPLINK_OFFSET + (UInt32)sizeof(SofIpcFwReady);
+	UInt32 hdr[3];
+
+	for (int n = 0; n < 16; n++) {
+		mboxRead(off, hdr, sizeof hdr);		/* size, cmd, type */
+		if (hdr[1] != SOF_IPC_FW_READY || hdr[0] < 12 || hdr[0] > 4096)
+			break;
+		SOFLOG("ext data: type %u size %u", (unsigned)hdr[2], (unsigned)hdr[0]);
+		if (hdr[2] == SOF_IPC_EXT_WINDOW) {
+			UInt32 num = dsp32(off + 12);
+			for (UInt32 i = 0; i < num && i < 16 && 16 + (i + 1) * 24 <= hdr[0]; i++) {
+				UInt32 e[6];	/* hdr.size, type, id, flags, size, offset */
+				mboxRead(off + 16 + i * 24, e, sizeof e);
+				UInt32 where = SOF_SRAM_WINDOW_OFFSET(e[2]) + e[5];
+				SOFLOG("  window: type %u id %u flags %x size 0x%x offset 0x%x -> BAR4 0x%x",
+				       (unsigned)e[1], (unsigned)e[2], (unsigned)e[3], (unsigned)e[4], (unsigned)e[5],
+				       (unsigned)where);
+				if (e[1] == SOF_IPC_REGION_DOWNBOX) { mHostBox = where; mHostBoxSize = e[4]; }
+				if (e[1] == SOF_IPC_REGION_UPBOX)   { mDspBox = where;  mDspBoxSize = e[4]; }
+			}
+		}
+		off += hdr[0];
+	}
+	if (!mHostBoxSize || !mDspBoxSize || mHostBox + mHostBoxSize > mDspLen || mDspBox + mDspBoxSize > mDspLen) {
+		SOFLOG("error: no usable mailbox (host 0x%x/0x%x dsp 0x%x/0x%x)", (unsigned)mHostBox,
+		       (unsigned)mHostBoxSize, (unsigned)mDspBox, (unsigned)mDspBoxSize);
+		return false;
+	}
+	SOFLOG("mailbox: host_box 0x%x (0x%x), dsp_box 0x%x (0x%x)", (unsigned)mHostBox, (unsigned)mHostBoxSize,
+	       (unsigned)mDspBox, (unsigned)mDspBoxSize);
+	return true;
+}
+
+/* DSP-initiated message (HIPCTDR BUSY): log it and ack (cnl_ipc_host_done) */
+void VoodooHDASof::serviceNotification()
+{
+	UInt32 tdr = dsp32(SOF_CNL_HIPCTDR);
+
+	if (!(tdr & SOF_IPC_BUSY))
+		return;
+	UInt32 tdd = dsp32(SOF_CNL_HIPCTDD);
+	UInt32 hdr[2] = { 0, 0 };
+	if (mDspBoxSize)
+		mboxRead(mDspBox, hdr, sizeof hdr);
+	if ((tdr & SOF_IPC_PANIC_MAGIC_MASK) == SOF_IPC_PANIC_MAGIC)
+		SOFLOG("error: DSP PANIC doorbell %08x code %08x", (unsigned)tdr, (unsigned)tdd);
+	else if (mNotifyCount < 20)
+		SOFLOG("notification: doorbell %08x ext %08x, msg cmd %08x size %u", (unsigned)tdr, (unsigned)tdd,
+		       (unsigned)hdr[1], (unsigned)hdr[0]);
+	mNotifyCount++;
+	dspUpdate32(SOF_CNL_HIPCTDR, SOF_IPC_BUSY, SOF_IPC_BUSY);
+	dspUpdate32(SOF_CNL_HIPCTDA, SOF_IPC_DONE, SOF_IPC_DONE);
+}
+
+/*
+ * cnl_ipc_send_msg() (mailbox path) + polled reply (hda_dsp_ipc_get_reply, cnl_ipc_dsp_done).
+ * size includes the 8-byte header; payload is size-8 bytes.
+ */
+bool VoodooHDASof::ipcTx(UInt32 cmd, const UInt8 *payload, UInt32 size, void *reply, UInt32 replyMax)
+{
+	UInt32 msg[SOF_IPC_MSG_MAX_SIZE / 4];
+	UInt32 rep[SOF_IPC_MSG_MAX_SIZE / 4];
+	UInt32 v, waited = 0;
+
+	if (size < 8 || size > sizeof msg || size > mHostBoxSize) {
+		SOFLOG("error: ipc %08x bad size %u", (unsigned)cmd, (unsigned)size);
+		return false;
+	}
+	if (dsp32(SOF_CNL_HIPCIDR) & SOF_IPC_BUSY)	/* Linux does not check this; just note it */
+		SOFLOG("warning: ipc %08x: HIPCIDR still busy (%08x)", (unsigned)cmd, (unsigned)dsp32(SOF_CNL_HIPCIDR));
+	bzero(msg, sizeof msg);
+	msg[0] = size;
+	msg[1] = cmd;
+	if (size > 8)
+		memcpy(&msg[2], payload, size - 8);
+	mboxWrite(mHostBox, msg, (size + 3) & ~3U);
+	dspW32(SOF_CNL_HIPCIDR, SOF_IPC_BUSY);
+
+	for (;;) {
+		v = dsp32(SOF_CNL_HIPCIDA);
+		if (v & SOF_IPC_DONE)
+			break;
+		serviceNotification();
+		if (waited >= SOF_IPC_TIMEOUT_US) {
+			SOFLOG("error: ipc %08x timeout (IDR %08x IDA %08x TDR %08x)", (unsigned)cmd,
+			       (unsigned)dsp32(SOF_CNL_HIPCIDR), (unsigned)v, (unsigned)dsp32(SOF_CNL_HIPCTDR));
+			return false;
+		}
+		if (waited < 2000) { IODelay(20); waited += 20; } else { IOSleep(1); waited += 1000; }
+	}
+
+	UInt32 rsize = dsp32(mDspBox);
+	if (rsize < 12 || rsize > sizeof rep || rsize > mDspBoxSize)
+		rsize = 12;
+	mboxRead(mDspBox, rep, rsize);
+	dspUpdate32(SOF_CNL_HIPCIDA, SOF_IPC_DONE, SOF_IPC_DONE);	/* cnl_ipc_dsp_done */
+	if (reply && replyMax)
+		memcpy(reply, rep, rsize < replyMax ? rsize : replyMax);
+
+	SInt32 err = (SInt32)rep[2];
+	if (mDbg || err)
+		SOFLOG("ipc %08x (%u B) -> reply cmd %08x size %u error %d (%u us)", (unsigned)cmd, (unsigned)size,
+		       (unsigned)rep[1], (unsigned)rep[0], (int)err, (unsigned)waited);
+	return err == 0;
+}
+
+bool VoodooHDASof::replayOne(int idx, const UInt8 *payloadOverride)
+{
+	if (idx < 0 || (unsigned)idx >= gSofReplayCount)
+		return false;
+	const SofReplayMsg *m = &gSofReplay[idx];
+	bool ok = ipcTx(m->cmd, payloadOverride ? payloadOverride : m->payload, m->size, NULL, 0);
+	SOFLOG("  #%02d %-13s %08x %3u B: %s", idx, m->name, (unsigned)m->cmd, (unsigned)m->size, ok ? "ok" : "FAILED");
+	return ok;
+}
+
+bool VoodooHDASof::replay(int from, int to)
+{
+	for (int i = from; i <= to; i++)
+		if (!replayOne(i))
+			return false;
+	return true;
+}
+
+/* free the DMIC pipeline: COMP_FREE/BUFFER_FREE/PIPE_FREE (#24-31) */
+void VoodooHDASof::teardownTopology()
+{
+	if (!mTopology)
+		return;
+	SOFLOG("freeing topology (#24-31)");
+	for (int i = 24; i <= 31; i++)
+		replayOne(i);
+	mTopology = false;
+}
+
+/* ============================================================================ */
+/* M3: DMIC capture                                                             */
+/* ============================================================================ */
+
+/*
+ * hda_dsp_pcm_hw_params() + hda_dsp_stream_hw_params() for the capture host stream,
+ * snd_sof_create_page_table(), PCM_PARAMS (#20, patched), host DMA start, TRIG_START (#21).
+ */
+bool VoodooHDASof::dmicStart()
+{
+	SofStream *s = &mDmic;
+	int iss = mDev->mInStreamsSup;
+	UInt32 v;
+
+	/* highest capture SD, never used by VoodooHDA; tag = capture index + 1 */
+	s->index = iss - 1;
+	s->tag = iss;
+	s->playback = false;
+	s->sd = SOF_SD_OFFSET(s->index);
+	for (int i = 0; i < mDev->mNumChannels; i++)
+		if ((mDev->mChannels[i].off >> 5) == s->index) {
+			SOFLOG("error: SD%d is used by VoodooHDA", s->index);
+			return false;
+		}
+
+	/* buffer + page table must be below 4 GB (32-bit phy_addr, 20-bit PFNs) */
+	mLow4G = true;
+	if (!streamAlloc(s, SOF_DMIC_BUF_SIZE, "SOF DMIC"))
+		return false;
+	mPageTable = allocDma(4096, "SOF DMIC page table");
+	mLow4G = false;
+	if (!mPageTable) {
+		SOFLOG("error: page table alloc failed");
+		return false;
+	}
+
+	/* page table: 20-bit PFNs packed 2.5 bytes each */
+	UInt8 *pt = (UInt8 *)mPageTable->virtAddr;
+	UInt32 pages = SOF_DMIC_BUF_SIZE / 4096;
+	for (UInt32 i = 0; i < pages; i++) {
+		UInt32 pfn = (UInt32)((s->buf->physAddr + i * 4096ULL) >> 12);
+		UInt8 *e = pt + ((5 * i) >> 1);
+		UInt32 w = (i & 1) ? ((e[0] & 0xF) | (pfn << 4)) : pfn;
+		e[0] = (UInt8)w; e[1] = (UInt8)(w >> 8); e[2] = (UInt8)(w >> 16); e[3] = (UInt8)(w >> 24);
+	}
+
+	/* BDL: one entry per 4 KB period, IOC set (no_ipc_position=1) */
+	SofBdlEntry *bdl = (SofBdlEntry *)s->bdl->virtAddr;
+	s->frags = (int)(SOF_DMIC_BUF_SIZE / SOF_DMIC_PERIOD);
+	for (int i = 0; i < s->frags; i++) {
+		UInt64 a = s->buf->physAddr + (UInt64)i * SOF_DMIC_PERIOD;
+		bdl[i].addrLo = (UInt32)a;
+		bdl[i].addrHi = (UInt32)(a >> 32);
+		bdl[i].size = SOF_DMIC_PERIOD;
+		bdl[i].ioc = 1;
+	}
+
+	/* hda_dsp_stream_hw_params() */
+	UInt32 mask = 1U << s->index;
+	hdaUpdate32(mPpCap + SOF_PP_PPCTL, mask, mask);
+	hdaUpdate32(s->sd, SOF_SD_INT_MASK | SOF_SD_CTL_DMA_START, 0);
+	pollHda(s->sd, SOF_SD_CTL_DMA_START, 0, SOF_STREAM_RUN_TIMEOUT_US, &v);
+	hdaW8(s->sd + SOF_SD_STS, SOF_SD_INT_MASK);
+	if (!streamReset(s))
+		return false;
+	hdaW32(s->sd + SOF_SD_BDLPL, 0);
+	hdaW32(s->sd + SOF_SD_BDLPU, 0);
+	hdaUpdate32(s->sd, SOF_SD_INT_MASK | SOF_SD_CTL_DMA_START, 0);
+	pollHda(s->sd, SOF_SD_CTL_DMA_START, 0, SOF_STREAM_RUN_TIMEOUT_US, &v);
+	hdaW8(s->sd + SOF_SD_STS, SOF_SD_INT_MASK);
+	hdaUpdate32(s->sd, SOF_SD_CTL_TAG_MASK, (UInt32)s->tag << SOF_SD_CTL_TAG_SHIFT);
+	hdaW32(s->sd + SOF_SD_CBL, SOF_DMIC_BUF_SIZE);
+	hdaW16(s->sd + SOF_SD_FORMAT, SOF_DMIC_FORMAT);
+	hdaW16(s->sd + SOF_SD_LVI, (UInt16)(s->frags - 1));
+	hdaW32(s->sd + SOF_SD_BDLPL, (UInt32)s->bdl->physAddr);
+	hdaW32(s->sd + SOF_SD_BDLPU, (UInt32)(s->bdl->physAddr >> 32));
+	hdaUpdate32(s->sd, SOF_SD_INT_MASK, SOF_SD_INT_MASK);	/* INTCTL stays off: no host irq */
+	if (mSpbCap) {						/* SPIB disabled (rewinds allowed) */
+		hdaUpdate32(mSpbCap + SOF_SPB_SPBFCCTL, mask, 0);
+		hdaW32(mSpbCap + SOF_SPB_SPIB(s->index), 0);
+	}
+	SOFLOG("DMIC host stream: SD%d tag %d ctl %08x cbl %08x lvi %04x fmt %04x buf 0x%llx pt 0x%llx",
+	       s->index, s->tag, (unsigned)hda32(s->sd), (unsigned)hda32(s->sd + SOF_SD_CBL),
+	       (unsigned)hda16(s->sd + SOF_SD_LVI), (unsigned)hda16(s->sd + SOF_SD_FORMAT),
+	       (unsigned long long)s->buf->physAddr, (unsigned long long)mPageTable->physAddr);
+
+	/* PCM_PARAMS (#20) with our buffer */
+	const SofReplayMsg *pm = &gSofReplay[20];
+	UInt8 pl[SOF_IPC_MSG_MAX_SIZE];
+	if (pm->cmd != SOF_IPC_STREAM_PCM_PARAMS || pm->size - 8 > sizeof pl) {
+		SOFLOG("error: replay #20 is not PCM_PARAMS");
+		return false;
+	}
+	memcpy(pl, pm->payload, pm->size - 8);
+	UInt32 phy = (UInt32)mPageTable->physAddr, sz = SOF_DMIC_BUF_SIZE;
+	UInt16 tag = (UInt16)s->tag;
+	memcpy(pl + SOF_PCMP_PHY_ADDR, &phy, 4);
+	memcpy(pl + SOF_PCMP_PAGES, &pages, 4);
+	memcpy(pl + SOF_PCMP_SIZE, &sz, 4);
+	memcpy(pl + SOF_PCMP_STREAM_TAG, &tag, 2);
+	UInt32 rep[4] = { 0, 0, 0, 0 };		/* sof_ipc_pcm_params_reply */
+	bool ok = ipcTx(pm->cmd, pl, pm->size, rep, sizeof rep);
+	SOFLOG("  #20 PCM_PARAMS (pt 0x%x, %u pages, tag %u): %s, reply comp %x posn_offset 0x%x",
+	       (unsigned)phy, (unsigned)pages, (unsigned)tag, ok ? "ok" : "FAILED", (unsigned)rep[3],
+	       (unsigned)dsp32(mDspBox + 16));
+	if (!ok)
+		return false;
+	mPcmParams = true;
+
+	/* trigger START: host DMA first, then IPC (sof_pcm_trigger, ipc_first=false) */
+	hdaUpdate32(s->sd, SOF_SD_CTL_DMA_START | SOF_SD_INT_MASK, SOF_SD_CTL_DMA_START | SOF_SD_INT_MASK);
+	if (!replayOne(21)) {
+		dmicStreamCleanup();
+		return false;
+	}
+	mCapturing = true;
+	mTicks = 0;
+	mLastLdp = 0xFFFFFFFFU;
+	SOFLOG("DMIC capture running: ctl %08x", (unsigned)hda32(s->sd));
+	return true;
+}
+
+void VoodooHDASof::dmicStreamCleanup()
+{
+	SofStream *s = &mDmic;
+	UInt32 v;
+
+	if (s->index < 0 || !s->buf)
+		return;
+	hdaUpdate32(s->sd, SOF_SD_CTL_DMA_START | SOF_SD_INT_MASK, 0);
+	pollHda(s->sd, SOF_SD_CTL_DMA_START, 0, SOF_STREAM_RUN_TIMEOUT_US, &v);
+	hdaW8(s->sd + SOF_SD_STS, SOF_SD_INT_MASK);
+	hdaW32(s->sd + SOF_SD_BDLPL, 0);
+	hdaW32(s->sd + SOF_SD_BDLPU, 0);
+	hdaW32(s->sd, 0);
+	hdaUpdate32(mPpCap + SOF_PP_PPCTL, 1U << s->index, 0);
+	streamFree(s);
+	if (mPageTable) {
+		mDev->freeDmaMemory(mPageTable);
+		mPageTable = NULL;
+	}
+}
+
+/* trigger STOP: IPC first, then host DMA; then PCM_FREE */
+void VoodooHDASof::dmicStop()
+{
+	if (mCapturing) {
+		replayOne(22);
+		mCapturing = false;
+	}
+	dmicStreamCleanup();
+	if (mPcmParams) {
+		replayOne(23);
+		mPcmParams = false;
+	}
+}
+
+/* integer 20*log10(x/32768) in tenths of dB (x > 0), ~0.3 dB accurate */
+static int dbfsTenths(UInt32 x)
+{
+	if (!x)
+		return -999;
+	int msb = 31 - __builtin_clz(x);
+	UInt32 frac = (msb >= 8) ? ((x >> (msb - 8)) & 0xFF) : ((x << (8 - msb)) & 0xFF);
+	/* log2(x) ~ msb + frac/256 (linear mantissa, max error ~0.086) */
+	int l2x256 = msb * 256 + (int)frac;
+	return ((l2x256 - 15 * 256) * 602) / 2560;	/* 6.02 dB per bit, tenths */
+}
+
+/* once per second: RMS/peak per channel over the whole 64 KB ring + position + notifications */
+void VoodooHDASof::logCapture()
+{
+	SofStream *s = &mDmic;
+	UInt32 pphc = mPpCap + 0x10 + 0x10 * (UInt32)s->index;
+	UInt32 ldp = hda32(pphc + 0x8), sts = hda8(s->sd + SOF_SD_STS);
+	const SInt16 *smp = (const SInt16 *)s->buf->virtAddr;
+	UInt64 sq[2] = { 0, 0 };
+	UInt32 peak[2] = { 0, 0 }, n = SOF_DMIC_BUF_SIZE / 4, nonzero = 0;
+
+	serviceNotification();
+	for (UInt32 i = 0; i < n; i++) {
+		for (int c = 0; c < 2; c++) {
+			SInt32 x = smp[2 * i + (UInt32)c];
+			UInt32 a = (UInt32)(x < 0 ? -x : x);
+			sq[c] += (UInt64)a * a;
+			if (a > peak[c])
+				peak[c] = a;
+			if (x)
+				nonzero++;
+		}
+	}
+	UInt32 rms[2];
+	for (int c = 0; c < 2; c++) {
+		UInt64 m = sq[c] / n, r = 0, bit = 1ULL << 62;
+		while (bit > m) bit >>= 2;
+		while (bit) { if (m >= r + bit) { m -= r + bit; r = (r >> 1) + bit; } else r >>= 1; bit >>= 2; }
+		rms[c] = (UInt32)r;
+	}
+	int dl = dbfsTenths(rms[0]), dr = dbfsTenths(rms[1]);
+	SOFLOG("rec t=%3us ldp %05x sts %02x | L rms %5u (%d.%d dBFS) peak %5u | R rms %5u (%d.%d dBFS) peak %5u | nz %u",
+	       (unsigned)mTicks, (unsigned)ldp, (unsigned)sts,
+	       (unsigned)rms[0], dl / 10, (dl < 0 ? -dl : dl) % 10, (unsigned)peak[0],
+	       (unsigned)rms[1], dr / 10, (dr < 0 ? -dr : dr) % 10, (unsigned)peak[1], (unsigned)nonzero);
+
+	/* if the host DMA never moves, try once with the firmware's non-snoop setting */
+	if (mTicks == 3 && ldp == mLastLdp && !nonzero && !mNsnpFallback && mDev->mOrigPciCfgValid) {
+		UInt16 fw = (UInt16)mDev->mOrigPciCfg[SOF_PCI_DEVC / 4] & SOF_PCI_DEVC_NSNPEN;
+		UInt16 cur = mPci->configRead16(SOF_PCI_DEVC);
+		if (fw && !(cur & SOF_PCI_DEVC_NSNPEN)) {
+			mPci->configWrite16(SOF_PCI_DEVC, (UInt16)(cur | SOF_PCI_DEVC_NSNPEN));
+			mNsnpFallback = true;
+			SOFLOG("no data after 3 s: DEVC NSNPEN -> firmware value (%04x)", (unsigned)mPci->configRead16(SOF_PCI_DEVC));
+		}
+	}
+	mLastLdp = ldp;
+}
+
+void VoodooHDASof::timerFired(OSObject *owner, IOTimerEventSource *sender)
+{
+	VoodooHDASof *self = OSDynamicCast(VoodooHDASof, owner);
+
+	if (!self || !self->mCapturing)
+		return;
+	self->mTicks++;
+	self->logCapture();
+	if (self->mTicks >= SOF_DMIC_LOG_SECONDS) {
+		SOFLOG("capture test finished after %u s, stopping", (unsigned)self->mTicks);
+		self->dmicStop();
+		self->teardownTopology();
+		if (self->mNsnpFallback) {
+			self->restoreDevc();
+			self->mPci->configWrite16(SOF_PCI_DEVC, self->mSavedDevc);
+			self->mNsnpFallback = false;
+		}
+		return;
+	}
+	sender->setTimeoutMS(1000);
 }
 
 /* ============================================================================ */
@@ -1119,12 +1534,57 @@ bool VoodooHDASof::start()
 	clock_get_uptime(&t1);
 	absolutetime_to_nanoseconds(t1 - t0, &ns);
 	SOFLOG("boot sequence %s after %llu ms", ok ? "finished" : "FAILED", (unsigned long long)(ns / 1000000));
-	return ok;
+	if (!ok || mStep < kSofStepIpc || !mFwReady)
+		return ok;
+
+	/* M3a: mailbox + topology */
+	if (!parseExtData())
+		return true;		/* DSP stays booted; no IPC */
+	SOFLOG("replaying topology (#0-19)");
+	mTopology = true;		/* partial topology is freed as well */
+	if (!replay(0, 19)) {
+		teardownTopology();
+		return true;
+	}
+	if (mStep < kSofStepCapture) {
+		SOFLOG("step %u reached (IPC OK)", (unsigned)mStep);
+		teardownTopology();
+		return true;
+	}
+
+	/* M3b: DMIC capture + 1 s RMS log on our own workloop */
+	if (!dmicStart()) {
+		dmicStop();
+		teardownTopology();
+		return true;
+	}
+	mWorkLoop = IOWorkLoop::workLoop();
+	mTimer = mWorkLoop ? IOTimerEventSource::timerEventSource(this, &VoodooHDASof::timerFired) : NULL;
+	if (!mTimer || mWorkLoop->addEventSource(mTimer) != kIOReturnSuccess) {
+		SOFLOG("error: no timer, stopping capture");
+		dmicStop();
+		teardownTopology();
+		return true;
+	}
+	mTimer->setTimeoutMS(1000);
+	return true;
 }
 
 void VoodooHDASof::stop()
 {
 	SOFDBG("stop");
+	if (mTimer) {
+		mTimer->cancelTimeout();
+		mTimer->disable();
+		if (mWorkLoop)
+			mWorkLoop->removeEventSource(mTimer);
+		mTimer->release();
+		mTimer = NULL;
+	}
+	if (mWorkLoop) {
+		mWorkLoop->release();
+		mWorkLoop = NULL;
+	}
 	powerDownDsp();
 	if (mDspMap) {
 		mDspMap->release();
