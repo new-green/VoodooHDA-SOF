@@ -341,8 +341,11 @@ void VoodooHDASof::dumpState(const char *when)
 		       (unsigned)dsp32(SOF_CNL_HIPCCTL));
 		/* SRAM windows are only meaningful (and only touched) once core 0 is powered. */
 		if (cs & SOF_ADSPCS_CPA(SOF_CORE0))
-			SOFLOG("sram: ROM_STATUS %08x ROM_ERROR %08x", (unsigned)dsp32(SOF_SRAM_ROM_STATUS),
-			       (unsigned)dsp32(SOF_SRAM_ROM_ERROR));
+			SOFLOG("sram: ext rom status %08x %08x %08x %08x %08x %08x %08x %08x",
+			       (unsigned)dsp32(SOF_DSP_MBOX_OFFSET + 0x00), (unsigned)dsp32(SOF_DSP_MBOX_OFFSET + 0x04),
+			       (unsigned)dsp32(SOF_DSP_MBOX_OFFSET + 0x08), (unsigned)dsp32(SOF_DSP_MBOX_OFFSET + 0x0C),
+			       (unsigned)dsp32(SOF_DSP_MBOX_OFFSET + 0x10), (unsigned)dsp32(SOF_DSP_MBOX_OFFSET + 0x14),
+			       (unsigned)dsp32(SOF_DSP_MBOX_OFFSET + 0x18), (unsigned)dsp32(SOF_DSP_MBOX_OFFSET + 0x1C));
 		else
 			SOFLOG("sram: core 0 not powered, SRAM window not read");
 	}
@@ -452,7 +455,13 @@ void VoodooHDASof::sspSetConsumer()
 /* streams                                                                      */
 /* ============================================================================ */
 
-bool VoodooHDASof::pickStreams()
+/*
+ * linuxStreams=false: highest free capture/playback SDs (never used by VoodooHDA).
+ * linuxStreams=true: exactly what Linux picks on a cold boot — first capture SD (ICCMAX) and
+ * first playback SD (code loader), both tag 1. These belong to VoodooHDA, so they are only
+ * borrowed while idle; VoodooHDA resets and fully reprograms an SD on every channel start.
+ */
+bool VoodooHDASof::pickStreams(bool linuxStreams)
 {
 	int iss = mDev->mInStreamsSup, oss = mDev->mOutStreamsSup;
 
@@ -460,24 +469,40 @@ bool VoodooHDASof::pickStreams()
 		SOFLOG("error: not enough streams (ISS %d OSS %d)", iss, oss);
 		return false;
 	}
-	/* highest capture and highest playback descriptor */
-	mIccmax.index = iss - 1;
-	mIccmax.tag = iss;
 	mIccmax.playback = false;
-	mLoader.index = iss + oss - 1;
-	mLoader.tag = oss;
 	mLoader.playback = true;
+	if (linuxStreams) {
+		mIccmax.index = 0;
+		mIccmax.tag = 1;
+		mLoader.index = iss;
+		mLoader.tag = 1;
+	} else {
+		mIccmax.index = iss - 1;
+		mIccmax.tag = iss;
+		mLoader.index = iss + oss - 1;
+		mLoader.tag = oss;
+	}
+	mIccmax.sd = SOF_SD_OFFSET(mIccmax.index);
+	mLoader.sd = SOF_SD_OFFSET(mLoader.index);
 
 	for (int i = 0; i < mDev->mNumChannels; i++) {
 		int sd = mDev->mChannels[i].off >> 5;
-		if (sd == mIccmax.index || sd == mLoader.index) {
+		if (sd != mIccmax.index && sd != mLoader.index)
+			continue;
+		if (!linuxStreams) {
 			SOFLOG("error: SD%d is used by VoodooHDA channel %d", sd, i);
 			mIccmax.index = mLoader.index = -1;
 			return false;
 		}
+		UInt32 ctl = hda32(SOF_SD_OFFSET(sd));
+		if (ctl & SOF_SD_CTL_DMA_START) {
+			SOFLOG("error: SD%d (VoodooHDA channel %d) is running (ctl %08x), not borrowing it",
+			       sd, i, (unsigned)ctl);
+			mIccmax.index = mLoader.index = -1;
+			return false;
+		}
+		SOFLOG("borrowing idle SD%d from VoodooHDA channel %d (ctl %08x)", sd, i, (unsigned)ctl);
 	}
-	mIccmax.sd = SOF_SD_OFFSET(mIccmax.index);
-	mLoader.sd = SOF_SD_OFFSET(mLoader.index);
 	SOFLOG("streams: code loader SD%d tag %d, ICCMAX SD%d tag %d", mLoader.index, mLoader.tag,
 	       mIccmax.index, mIccmax.tag);
 	return true;
@@ -894,8 +919,6 @@ bool VoodooHDASof::bootFirmware()
 		SOFLOG("error: no PP capability");
 		return false;
 	}
-	if (!pickStreams())
-		return false;
 	if (dsp32(SOF_DSP_REG_ADSPCS) & SOF_ADSPCS_CPA(SOF_CORE0)) {
 		SOFLOG("error: core 0 already powered (ADSPCS %08x), not touching it",
 		       (unsigned)dsp32(SOF_DSP_REG_ADSPCS));
@@ -907,18 +930,24 @@ bool VoodooHDASof::bootFirmware()
 	mSavedLtrp = hda8(SOF_VS_LTRP);
 
 	/*
-	 * Variant A: buffers anywhere, no SD interrupt enables.
-	 * Variant B (only if A fails at FW download): buffers below 4 GB, SD interrupt enable bits
-	 * and BDL IOC exactly as Linux (INTCTL still off, so no host interrupt).
+	 * d5 showed: with SD15/SD6 the ROM fetches 32 KB, loads both manifests, then halts
+	 * (0x80000003); buffers below 4 GB and Linux SD int bits/IOC made no difference.
+	 * Variant 1: Linux's exact streams (loader SD(ISS) tag 1, ICCMAX SD0 tag 1).
+	 * Variant 2: same streams, without the ICCMAX stream.
 	 */
 	bool entered = false;
-	for (int variant = 0; variant < 2 && !entered; variant++) {
-		mLow4G = mLinuxIntBits = (variant == 1);
-		SOFLOG("==== variant %c: %s ====", 'A' + variant,
-		       variant ? "below 4 GB + Linux SD int bits/IOC" : "default");
+	for (int variant = 1; variant <= 2 && !entered; variant++) {
+		bool useIccmax = (variant == 1);
+		mLow4G = false;
+		mLinuxIntBits = true;
+		SOFLOG("==== variant %d: Linux streams%s ====", variant, useIccmax ? " + ICCMAX" : ", no ICCMAX");
+		if (!pickStreams(true)) {
+			abortBoot("no streams");
+			return false;
+		}
 
 		/* ICCMAX workaround stream */
-		if (!iccmaxStart()) {
+		if (useIccmax && !iccmaxStart()) {
 			abortBoot("ICCMAX stream");
 			return false;
 		}

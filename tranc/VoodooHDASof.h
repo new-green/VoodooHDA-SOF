@@ -222,7 +222,7 @@ private:
 	void sspSetConsumer();
 
 	/* streams (hda-stream.c, hda-loader.c) */
-	bool pickStreams();
+	bool pickStreams(bool linuxStreams);
 	struct _DmaMemory *allocDma(UInt32 size, const char *what);
 	bool streamAlloc(SofStream *s, UInt32 size, const char *what);
 	void streamFree(SofStream *s);
