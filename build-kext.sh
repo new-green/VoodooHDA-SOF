@@ -13,7 +13,7 @@ OBJ="$OUT/obj"
 KEXT="$OUT/VoodooHDA.kext"
 
 BUNDLE_ID=org.voodoo.driver.VoodooHDA
-KEXT_VERSION="${KEXT_VERSION:-3.6.8d7}"
+KEXT_VERSION="${KEXT_VERSION:-3.6.8d8}"
 MIN_OS=10.13
 
 SDK="${SDK:-$(xcrun --sdk macosx --show-sdk-path)}"

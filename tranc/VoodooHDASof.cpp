@@ -807,9 +807,19 @@ err:
 	return false;
 }
 
+void VoodooHDASof::restoreDevc()
+{
+	if (!mDevcChanged)
+		return;
+	mPci->configWrite16(SOF_PCI_DEVC, mSavedDevc);
+	mDevcChanged = false;
+	SOFLOG("DEVC restored to VoodooHDA value %04x", (unsigned)mPci->configRead16(SOF_PCI_DEVC));
+}
+
 void VoodooHDASof::abortBoot(const char *why)
 {
 	SOFLOG("boot aborted: %s", why);
+	restoreDevc();
 	if (mDspPowered)
 		coreResetPowerDown(SOF_CORE0);
 	loaderCleanup();
@@ -959,6 +969,24 @@ bool VoodooHDASof::bootFirmware()
 		}
 	}
 
+	/*
+	 * VoodooHDA clears DEVC (0x78) bit 11 NSNPEN to force snooped DMA; Linux SOF leaves the
+	 * firmware value (NSNPEN=1 here). Give the DSP the firmware value for the boot window only;
+	 * VoodooHDA's value is put back in restoreDevc().
+	 */
+	mSavedDevc = mPci->configRead16(SOF_PCI_DEVC);
+	mDevcChanged = false;
+	if (mDev->mOrigPciCfgValid) {
+		UInt16 fwDevc = (UInt16)mDev->mOrigPciCfg[SOF_PCI_DEVC / 4];
+		UInt16 want = (UInt16)((mSavedDevc & ~SOF_PCI_DEVC_NSNPEN) | (fwDevc & SOF_PCI_DEVC_NSNPEN));
+		if (want != mSavedDevc) {
+			mPci->configWrite16(SOF_PCI_DEVC, want);
+			mDevcChanged = true;
+			SOFLOG("DEVC NSNPEN set to firmware value for DSP boot: %04x -> %04x", (unsigned)mSavedDevc,
+			       (unsigned)mPci->configRead16(SOF_PCI_DEVC));
+		}
+	}
+
 	/* pre_fw_run */
 	clockPowerGating(false);
 	mSavedLtrp = hda8(SOF_VS_LTRP);
@@ -1041,6 +1069,7 @@ bool VoodooHDASof::bootFirmware()
 
 	/* post_fw_run */
 	clockPowerGating(true);
+	restoreDevc();
 	SOFLOG("firmware boot complete");
 	dumpState("FW_READY");
 	return true;

@@ -31,6 +31,8 @@ struct _DmaMemory;
 #define SOF_PCI_PGCTL			0x44	/* == TCSEL on legacy HDA */
 #define SOF_PCI_PGCTL_ADSPPGD		(1U << 2)
 #define SOF_PCI_CGCTL			0x48
+#define SOF_PCI_DEVC			0x78	/* INTEL_SCH_HDA_DEVC */
+#define SOF_PCI_DEVC_NSNPEN		(1U << 11)
 #define SOF_PCI_CGCTL_ADSPDCGE		(1U << 1)
 
 /* ---- HDA BAR0 (hda_register.h, hda.h) ---- */
@@ -185,6 +187,8 @@ private:
 	bool mDspPowered;		/* core 0 powered by us */
 	bool mFwReady;
 	bool mGatingDisabled;
+	bool mDevcChanged;
+	UInt16 mSavedDevc;
 	bool mSavedEm2L1;
 	UInt8 mSavedLtrp;
 	bool mLow4G;			/* experiment: DMA buffers below 4 GB */
@@ -241,6 +245,7 @@ private:
 	bool bootFirmware();
 	bool traceCopy(UInt32 *lastFsr);
 	bool waitFwReady();
+	void restoreDevc();
 	void abortBoot(const char *why);
 	void powerDownDsp();
 };
