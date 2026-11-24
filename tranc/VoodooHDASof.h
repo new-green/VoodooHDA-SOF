@@ -301,6 +301,7 @@ private:
 
 	/* M3: IPC3 (cnl.c, hda-ipc.c, ipc3.c) */
 	bool parseExtData();
+	bool parseExtDataAt(UInt32 off);
 	void mboxWrite(UInt32 off, const void *buf, UInt32 len);
 	void mboxRead(UInt32 off, void *buf, UInt32 len);
 	bool ipcTx(UInt32 cmd, const UInt8 *payload, UInt32 size, void *reply, UInt32 replyMax);

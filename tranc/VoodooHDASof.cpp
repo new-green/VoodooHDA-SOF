@@ -1141,7 +1141,30 @@ void VoodooHDASof::mboxRead(UInt32 off, void *buf, UInt32 len)
 /* ipc3_fw_parse_ext_data() + ipc3_get_windows(): find host_box / dsp_box */
 bool VoodooHDASof::parseExtData()
 {
-	UInt32 off = SOF_DSP_MBOX_UPLINK_OFFSET + (UInt32)sizeof(SofIpcFwReady);
+	if (parseExtDataAt(SOF_DSP_MBOX_UPLINK_OFFSET + (UInt32)sizeof(SofIpcFwReady)))
+		return true;
+
+	/* not where Linux expects it: find every ext header (cmd == FW_READY) in the SRAM windows */
+	SOFLOG("ext data not after fw_ready (fw_ready hdr.size %u), scanning SRAM windows",
+	       (unsigned)dsp32(SOF_DSP_MBOX_UPLINK_OFFSET));
+	int hits = 0;
+	for (UInt32 off = SOF_DSP_MBOX_OFFSET; off + 32 <= mDspLen && hits < 16; off += 4) {
+		if (dsp32(off + 4) != SOF_IPC_FW_READY)
+			continue;
+		UInt32 sz = dsp32(off), type = dsp32(off + 8);
+		SOFLOG("  hit @0x%05x: size %u type %u | %08x %08x %08x %08x %08x", (unsigned)off, (unsigned)sz,
+		       (unsigned)type, (unsigned)dsp32(off + 12), (unsigned)dsp32(off + 16), (unsigned)dsp32(off + 20),
+		       (unsigned)dsp32(off + 24), (unsigned)dsp32(off + 28));
+		hits++;
+		if (!mHostBoxSize && type == SOF_IPC_EXT_WINDOW && sz >= 16 && sz <= 4096)
+			parseExtDataAt(off);
+	}
+	SOFLOG("scan done: %d hits", hits);
+	return mHostBoxSize && mDspBoxSize;
+}
+
+bool VoodooHDASof::parseExtDataAt(UInt32 off)
+{
 	UInt32 hdr[3];
 
 	for (int n = 0; n < 16; n++) {
