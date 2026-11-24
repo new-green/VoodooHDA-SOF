@@ -13,7 +13,7 @@ OBJ="$OUT/obj"
 KEXT="$OUT/VoodooHDA.kext"
 
 BUNDLE_ID=org.voodoo.driver.VoodooHDA
-KEXT_VERSION="${KEXT_VERSION:-3.6.8d2}"
+KEXT_VERSION="${KEXT_VERSION:-3.6.8d3}"
 MIN_OS=10.13
 
 SDK="${SDK:-$(xcrun --sdk macosx --show-sdk-path)}"
@@ -62,6 +62,24 @@ for entry in "${SOURCES[@]}"; do
   xcrun clang "${lang[@]}" "${COMMON[@]}" $extra -c "$SRC/$f" -o "$o"
   objs+=("$o")
 done
+
+# Embedded SOF firmware (sof-adl.ri), verified against SHA256SUMS before embedding
+FWDIR="${FWDIR:-$ROOT/../firmware}"
+FW="$FWDIR/sof-adl.ri"
+want=$(awk '$2=="sof-adl.ri"{print $1}' "$FWDIR/SHA256SUMS")
+have=$(shasum -a 256 "$FW" | awk '{print $1}')
+[ -n "$want" ] && [ "$want" = "$have" ] || { echo "firmware SHA256 mismatch: $FW"; exit 1; }
+{
+  echo "/* generated from sof-adl.ri sha256 $have */"
+  echo "__attribute__((visibility(\"hidden\"), aligned(16))) const unsigned char gSofFirmware[] = {"
+  xxd -i < "$FW"
+  echo "};"
+  echo "__attribute__((visibility(\"hidden\"))) const unsigned int gSofFirmwareSize = sizeof(gSofFirmware);"
+} > "$OBJ/sof_firmware.c"
+echo "  CC  sof_firmware.c ($(wc -c < "$FW" | tr -d ' ') bytes)"
+xcrun clang "${CFLAGS[@]}" -arch x86_64 -isysroot "$SDK" -mmacosx-version-min=$MIN_OS -mkernel \
+  -nostdinc -O0 -c "$OBJ/sof_firmware.c" -o "$OBJ/sof_firmware.o"
+objs+=("$OBJ/sof_firmware.o")
 
 # kmod_info (what Xcode generates as <product>_info.c)
 cat > "$OBJ/kmod_info.c" <<EOF
