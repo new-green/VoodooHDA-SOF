@@ -1139,8 +1139,49 @@ void VoodooHDASof::mboxRead(UInt32 off, void *buf, UInt32 len)
 }
 
 /* ipc3_fw_parse_ext_data() + ipc3_get_windows(): find host_box / dsp_box */
+/*
+ * sof_ipc3_fw_parse_ext_man(): SOF 2.x carries the window list in the firmware file's
+ * extended manifest (element SOF_EXT_MAN_ELEM_WINDOW), not in the FW_READY mailbox.
+ */
+bool VoodooHDASof::parseExtManWindows()
+{
+	const UInt8 *fw = gSofFirmware;
+	UInt32 full = *(const UInt32 *)(fw + 4), hsz = *(const UInt32 *)(fw + 8);
+
+	if (*(const UInt32 *)fw != SOF_EXT_MAN_MAGIC || full > gSofFirmwareSize || hsz < 16 || hsz >= full)
+		return false;
+	for (UInt32 off = hsz; off + 8 <= full; ) {
+		UInt32 type = *(const UInt32 *)(fw + off), size = *(const UInt32 *)(fw + off + 4);
+		if (size < 8 || off + size > full)
+			break;
+		if (type == SOF_EXT_MAN_ELEM_WINDOW && size >= 8 + 16) {
+			const UInt8 *w = fw + off + 8;		/* struct sof_ipc_window */
+			UInt32 num = *(const UInt32 *)(w + 12);
+			SOFLOG("ext manifest: %u windows", (unsigned)num);
+			for (UInt32 i = 0; i < num && i < 16 && 8 + 16 + (i + 1) * 24 <= size; i++) {
+				const UInt32 *e = (const UInt32 *)(w + 16 + i * 24);	/* hdr, type, id, flags, size, offset */
+				UInt32 where = SOF_SRAM_WINDOW_OFFSET(e[2]) + e[5];
+				SOFLOG("  window: type %u id %u size 0x%x offset 0x%x -> BAR4 0x%x", (unsigned)e[1],
+				       (unsigned)e[2], (unsigned)e[4], (unsigned)e[5], (unsigned)where);
+				if (e[1] == SOF_IPC_REGION_DOWNBOX) { mHostBox = where; mHostBoxSize = e[4]; }
+				if (e[1] == SOF_IPC_REGION_UPBOX)   { mDspBox = where;  mDspBoxSize = e[4]; }
+			}
+		}
+		off += size;
+	}
+	if (!mHostBoxSize || !mDspBoxSize || mHostBox + mHostBoxSize > mDspLen || mDspBox + mDspBoxSize > mDspLen) {
+		mHostBoxSize = mDspBoxSize = 0;
+		return false;
+	}
+	SOFLOG("mailbox (ext manifest): host_box 0x%x (0x%x), dsp_box 0x%x (0x%x)", (unsigned)mHostBox,
+	       (unsigned)mHostBoxSize, (unsigned)mDspBox, (unsigned)mDspBoxSize);
+	return true;
+}
+
 bool VoodooHDASof::parseExtData()
 {
+	if (parseExtManWindows())
+		return true;
 	if (parseExtDataAt(SOF_DSP_MBOX_UPLINK_OFFSET + (UInt32)sizeof(SofIpcFwReady)))
 		return true;
 

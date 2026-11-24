@@ -133,6 +133,7 @@ struct _DmaMemory;
 #define SOF_IPC_MSG_MAX_SIZE		384
 #define SOF_IPC_TIMEOUT_US		500000
 #define SOF_IPC_EXT_WINDOW		1
+#define SOF_EXT_MAN_ELEM_WINDOW		1
 #define SOF_IPC_REGION_DOWNBOX		0	/* host -> DSP (host_box) */
 #define SOF_IPC_REGION_UPBOX		1	/* DSP -> host (dsp_box) */
 #define SOF_IPC_REGION_STREAM		4
@@ -300,6 +301,7 @@ private:
 	void powerDownDsp();
 
 	/* M3: IPC3 (cnl.c, hda-ipc.c, ipc3.c) */
+	bool parseExtManWindows();
 	bool parseExtData();
 	bool parseExtDataAt(UInt32 off);
 	void mboxWrite(UInt32 off, const void *buf, UInt32 len);
