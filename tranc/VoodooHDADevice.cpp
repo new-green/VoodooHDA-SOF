@@ -12,6 +12,7 @@
 #include "OssCompat.h"
 #include "AppleALCPinConfigs.h"
 #include "VoodooHDASof.h"
+#include "VoodooHDASofEngine.h"
 
 #include "Shared.h"
 
@@ -864,6 +865,15 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 			errorMsg("VoodooHDA SOF: start failed, continuing without DSP\n");
 			mSof->release();
 			mSof = NULL;
+		}
+		/* M4: publish the DMIC capture engine ("Dahili Mikrofon") */
+		if (mSof && mSof->captureReady()) {
+			VoodooHDASofEngine *sofEngine = new VoodooHDASofEngine;
+			if (sofEngine && sofEngine->initWithSof(mSof) && activateAudioEngine(sofEngine) == kIOReturnSuccess)
+				IOLog("VoodooHDA SOF: capture engine published\n");
+			else
+				errorMsg("VoodooHDA SOF: capture engine could not be published\n");
+			RELEASE(sofEngine);
 		}
 	}
 

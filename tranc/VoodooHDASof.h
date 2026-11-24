@@ -15,7 +15,8 @@
  *   voodoosofstep=N     stop after milestone step N (default: highest implemented)
  *                       1 = read-only probe, 2 = DSP power-up + ROM init (then power down again),
  *                       3 = full firmware load until FW_READY, 4 = + IPC topology replay (and free),
- *                       5 = + DMIC capture with RMS logging for SOF_DMIC_LOG_SECONDS, then stop
+ *                       5 = + DMIC capture with RMS logging for SOF_DMIC_LOG_SECONDS, then stop,
+ *                       6 = normal: topology loaded, "Dahili Mikrofon" engine starts/stops capture
  */
 
 #ifndef _VOODOO_HDA_SOF_H
@@ -25,6 +26,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOLocks.h>
 
 class VoodooHDADevice;
 class IOPCIDevice;
@@ -147,6 +149,9 @@ struct _DmaMemory;
 #define SOF_DMIC_BUF_SIZE		0x10000
 #define SOF_DMIC_PERIOD			0x1000
 #define SOF_DMIC_FORMAT			0x0011	/* 48 kHz base, 16 bit, 2 ch */
+#define SOF_DMIC_RATE			48000
+#define SOF_DMIC_CHANNELS		2
+#define SOF_DMIC_FRAME_BYTES		4
 #define SOF_DMIC_LOG_SECONDS		300
 /* PCM_PARAMS payload offsets (after the 8-byte sof_ipc_cmd_hdr) */
 #define SOF_PCMP_PHY_ADDR		24
@@ -173,7 +178,8 @@ enum {
 	kSofStepFw = 3,		/* M2b: code loader DMA, FW_ENTERED, FW_READY */
 	kSofStepIpc = 4,	/* M3a: mailbox windows, replay topology #0-19, free it again #24-31 */
 	kSofStepCapture = 5,	/* M3b: + DMIC host stream, PCM_PARAMS, TRIG_START, RMS log, stop */
-	kSofStepMax = kSofStepCapture
+	kSofStepEngine = 6,	/* M4: topology stays loaded, "Dahili Mikrofon" engine drives capture */
+	kSofStepMax = kSofStepEngine
 };
 
 /* IPC3 replay list generated at build time from trace/ipc-replay.json */
@@ -207,6 +213,13 @@ public:
 	bool start();
 	void stop();
 	virtual void free() override;
+
+	/* capture API for VoodooHDASofEngine (locked) */
+	bool captureReady();
+	bool captureStart();
+	void captureStop();
+	UInt32 captureFrame();
+	void *captureBuffer();
 
 private:
 	VoodooHDADevice *mDev;		/* owner, not retained */
@@ -246,6 +259,8 @@ private:
 	UInt32 mLastLdp;
 	UInt32 mNotifyCount;
 	bool mNsnpFallback;
+	UInt32 mLdp0;			/* host DMA linear position at capture start */
+	IOLock *mLock;			/* IPC + capture state (engine runs on the audio workloop) */
 
 	bool initWithDevice(VoodooHDADevice *device);
 	bool mapDsp();
@@ -313,9 +328,12 @@ private:
 	void teardownTopology();
 
 	/* M3: DMIC capture (hda-pcm.c, hda-stream.c, ipc3-pcm.c, sof-utils.c) */
+	bool dmicAlloc();
+	void dmicFree();
+	bool dmicHwParams();
+	void dmicHwStop();
 	bool dmicStart();
 	void dmicStop();
-	void dmicStreamCleanup();
 	void logCapture();
 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
 };

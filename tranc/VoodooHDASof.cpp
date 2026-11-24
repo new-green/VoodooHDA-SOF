@@ -71,6 +71,8 @@ struct SofIpcFwReady {
 
 OSDefineMetaClassAndStructors(VoodooHDASof, OSObject)
 
+static void sofFreeDma(DmaMemory *d);
+
 /* ============================================================================ */
 /* setup                                                                        */
 /* ============================================================================ */
@@ -118,6 +120,9 @@ bool VoodooHDASof::initWithDevice(VoodooHDADevice *device)
 	if (PE_parse_boot_argn("voodoosofstep", &val, sizeof val) && val >= 1 && val <= kSofStepMax)
 		mStep = val;
 	mLoader.index = mIccmax.index = mDmic.index = -1;
+	mLock = IOLockAlloc();
+	if (!mLock)
+		return false;
 	return true;
 }
 
@@ -581,11 +586,11 @@ bool VoodooHDASof::streamAlloc(SofStream *s, UInt32 size, const char *what)
 void VoodooHDASof::streamFree(SofStream *s)
 {
 	if (s->buf) {
-		mDev->freeDmaMemory(s->buf);
+		sofFreeDma(s->buf);
 		s->buf = NULL;
 	}
 	if (s->bdl) {
-		mDev->freeDmaMemory(s->bdl);
+		sofFreeDma(s->bdl);
 		s->bdl = NULL;
 	}
 }
@@ -1094,7 +1099,7 @@ void VoodooHDASof::powerDownDsp()
 		dmicStop();
 		teardownTopology();
 	} else {
-		dmicStreamCleanup();
+		dmicHwStop();
 	}
 	if (mNsnpFallback) {
 		mPci->configWrite16(SOF_PCI_DEVC, mSavedDevc);
@@ -1341,22 +1346,31 @@ void VoodooHDASof::teardownTopology()
 }
 
 /* ============================================================================ */
-/* M3: DMIC capture                                                             */
+/* M3/M4: DMIC capture                                                          */
 /* ============================================================================ */
 
-/*
- * hda_dsp_pcm_hw_params() + hda_dsp_stream_hw_params() for the capture host stream,
- * snd_sof_create_page_table(), PCM_PARAMS (#20, patched), host DMA start, TRIG_START (#21).
- */
-bool VoodooHDASof::dmicStart()
+/* freeDmaMemory() equivalent that does not need the (possibly gone) VoodooHDADevice */
+static void sofFreeDma(DmaMemory *d)
+{
+	if (!d)
+		return;
+	if (d->md) {
+		d->md->complete();
+		d->md->release();
+	}
+	delete d;
+}
+
+/* one-time: 64 KB buffer + BDL + page table, all below 4 GB (32-bit phy_addr, 20-bit PFNs) */
+bool VoodooHDASof::dmicAlloc()
 {
 	SofStream *s = &mDmic;
 	int iss = mDev->mInStreamsSup;
-	UInt32 v;
 
-	/* highest capture SD, never used by VoodooHDA; tag = capture index + 1 */
-	s->index = iss - 1;
-	s->tag = iss;
+	if (s->buf)
+		return true;
+	s->index = iss - 1;		/* highest capture SD, never used by VoodooHDA */
+	s->tag = iss;			/* tag = capture index + 1 */
 	s->playback = false;
 	s->sd = SOF_SD_OFFSET(s->index);
 	for (int i = 0; i < mDev->mNumChannels; i++)
@@ -1365,21 +1379,19 @@ bool VoodooHDASof::dmicStart()
 			return false;
 		}
 
-	/* buffer + page table must be below 4 GB (32-bit phy_addr, 20-bit PFNs) */
 	mLow4G = true;
-	if (!streamAlloc(s, SOF_DMIC_BUF_SIZE, "SOF DMIC"))
-		return false;
-	mPageTable = allocDma(4096, "SOF DMIC page table");
+	bool ok = streamAlloc(s, SOF_DMIC_BUF_SIZE, "SOF DMIC");
+	mPageTable = ok ? allocDma(4096, "SOF DMIC page table") : NULL;
 	mLow4G = false;
-	if (!mPageTable) {
-		SOFLOG("error: page table alloc failed");
+	if (!ok || !mPageTable) {
+		SOFLOG("error: DMIC buffer allocation failed");
+		dmicFree();
 		return false;
 	}
 
-	/* page table: 20-bit PFNs packed 2.5 bytes each */
+	/* snd_sof_create_page_table(): 20-bit PFNs packed 2.5 bytes each */
 	UInt8 *pt = (UInt8 *)mPageTable->virtAddr;
-	UInt32 pages = SOF_DMIC_BUF_SIZE / 4096;
-	for (UInt32 i = 0; i < pages; i++) {
+	for (UInt32 i = 0; i < SOF_DMIC_BUF_SIZE / 4096; i++) {
 		UInt32 pfn = (UInt32)((s->buf->physAddr + i * 4096ULL) >> 12);
 		UInt8 *e = pt + ((5 * i) >> 1);
 		UInt32 w = (i & 1) ? ((e[0] & 0xF) | (pfn << 4)) : pfn;
@@ -1396,9 +1408,29 @@ bool VoodooHDASof::dmicStart()
 		bdl[i].size = SOF_DMIC_PERIOD;
 		bdl[i].ioc = 1;
 	}
+	SOFLOG("DMIC buffers: SD%d tag %d buf 0x%llx pt 0x%llx", s->index, s->tag,
+	       (unsigned long long)s->buf->physAddr, (unsigned long long)mPageTable->physAddr);
+	return true;
+}
 
-	/* hda_dsp_stream_hw_params() */
-	UInt32 mask = 1U << s->index;
+void VoodooHDASof::dmicFree()
+{
+	SofStream *s = &mDmic;
+
+	sofFreeDma(s->buf);
+	s->buf = NULL;
+	sofFreeDma(s->bdl);
+	s->bdl = NULL;
+	sofFreeDma(mPageTable);
+	mPageTable = NULL;
+}
+
+/* hda_dsp_pcm_hw_params() -> hda_dsp_stream_hw_params() for the capture host stream */
+bool VoodooHDASof::dmicHwParams()
+{
+	SofStream *s = &mDmic;
+	UInt32 mask = 1U << s->index, v;
+
 	hdaUpdate32(mPpCap + SOF_PP_PPCTL, mask, mask);
 	hdaUpdate32(s->sd, SOF_SD_INT_MASK | SOF_SD_CTL_DMA_START, 0);
 	pollHda(s->sd, SOF_SD_CTL_DMA_START, 0, SOF_STREAM_RUN_TIMEOUT_US, &v);
@@ -1421,53 +1453,16 @@ bool VoodooHDASof::dmicStart()
 		hdaUpdate32(mSpbCap + SOF_SPB_SPBFCCTL, mask, 0);
 		hdaW32(mSpbCap + SOF_SPB_SPIB(s->index), 0);
 	}
-	SOFLOG("DMIC host stream: SD%d tag %d ctl %08x cbl %08x lvi %04x fmt %04x buf 0x%llx pt 0x%llx",
-	       s->index, s->tag, (unsigned)hda32(s->sd), (unsigned)hda32(s->sd + SOF_SD_CBL),
-	       (unsigned)hda16(s->sd + SOF_SD_LVI), (unsigned)hda16(s->sd + SOF_SD_FORMAT),
-	       (unsigned long long)s->buf->physAddr, (unsigned long long)mPageTable->physAddr);
-
-	/* PCM_PARAMS (#20) with our buffer */
-	const SofReplayMsg *pm = &gSofReplay[20];
-	UInt8 pl[SOF_IPC_MSG_MAX_SIZE];
-	if (pm->cmd != SOF_IPC_STREAM_PCM_PARAMS || pm->size - 8 > sizeof pl) {
-		SOFLOG("error: replay #20 is not PCM_PARAMS");
-		return false;
-	}
-	memcpy(pl, pm->payload, pm->size - 8);
-	UInt32 phy = (UInt32)mPageTable->physAddr, sz = SOF_DMIC_BUF_SIZE;
-	UInt16 tag = (UInt16)s->tag;
-	memcpy(pl + SOF_PCMP_PHY_ADDR, &phy, 4);
-	memcpy(pl + SOF_PCMP_PAGES, &pages, 4);
-	memcpy(pl + SOF_PCMP_SIZE, &sz, 4);
-	memcpy(pl + SOF_PCMP_STREAM_TAG, &tag, 2);
-	UInt32 rep[4] = { 0, 0, 0, 0 };		/* sof_ipc_pcm_params_reply */
-	bool ok = ipcTx(pm->cmd, pl, pm->size, rep, sizeof rep);
-	SOFLOG("  #20 PCM_PARAMS (pt 0x%x, %u pages, tag %u): %s, reply comp %x posn_offset 0x%x",
-	       (unsigned)phy, (unsigned)pages, (unsigned)tag, ok ? "ok" : "FAILED", (unsigned)rep[3],
-	       (unsigned)dsp32(mDspBox + 16));
-	if (!ok)
-		return false;
-	mPcmParams = true;
-
-	/* trigger START: host DMA first, then IPC (sof_pcm_trigger, ipc_first=false) */
-	hdaUpdate32(s->sd, SOF_SD_CTL_DMA_START | SOF_SD_INT_MASK, SOF_SD_CTL_DMA_START | SOF_SD_INT_MASK);
-	if (!replayOne(21)) {
-		dmicStreamCleanup();
-		return false;
-	}
-	mCapturing = true;
-	mTicks = 0;
-	mLastLdp = 0xFFFFFFFFU;
-	SOFLOG("DMIC capture running: ctl %08x", (unsigned)hda32(s->sd));
 	return true;
 }
 
-void VoodooHDASof::dmicStreamCleanup()
+/* host DMA stop + SD back to idle and coupled; buffers are kept */
+void VoodooHDASof::dmicHwStop()
 {
 	SofStream *s = &mDmic;
 	UInt32 v;
 
-	if (s->index < 0 || !s->buf)
+	if (s->index < 0)
 		return;
 	hdaUpdate32(s->sd, SOF_SD_CTL_DMA_START | SOF_SD_INT_MASK, 0);
 	pollHda(s->sd, SOF_SD_CTL_DMA_START, 0, SOF_STREAM_RUN_TIMEOUT_US, &v);
@@ -1476,25 +1471,112 @@ void VoodooHDASof::dmicStreamCleanup()
 	hdaW32(s->sd + SOF_SD_BDLPU, 0);
 	hdaW32(s->sd, 0);
 	hdaUpdate32(mPpCap + SOF_PP_PPCTL, 1U << s->index, 0);
-	streamFree(s);
-	if (mPageTable) {
-		mDev->freeDmaMemory(mPageTable);
-		mPageTable = NULL;
-	}
 }
 
-/* trigger STOP: IPC first, then host DMA; then PCM_FREE */
+/* PCM_PARAMS (#20, patched) + host DMA start + TRIG_START (#21). Caller holds mLock. */
+bool VoodooHDASof::dmicStart()
+{
+	SofStream *s = &mDmic;
+
+	if (mCapturing)
+		return true;
+	if (!mFwReady || !mTopology || !dmicAlloc())
+		return false;
+	bzero((void *)s->buf->virtAddr, SOF_DMIC_BUF_SIZE);
+	if (!dmicHwParams()) {
+		dmicHwStop();
+		return false;
+	}
+
+	const SofReplayMsg *pm = &gSofReplay[20];
+	UInt8 pl[SOF_IPC_MSG_MAX_SIZE];
+	if (pm->cmd != SOF_IPC_STREAM_PCM_PARAMS || pm->size - 8 > sizeof pl) {
+		SOFLOG("error: replay #20 is not PCM_PARAMS");
+		dmicHwStop();
+		return false;
+	}
+	memcpy(pl, pm->payload, pm->size - 8);
+	UInt32 phy = (UInt32)mPageTable->physAddr, sz = SOF_DMIC_BUF_SIZE, pages = SOF_DMIC_BUF_SIZE / 4096;
+	UInt16 tag = (UInt16)s->tag;
+	memcpy(pl + SOF_PCMP_PHY_ADDR, &phy, 4);
+	memcpy(pl + SOF_PCMP_PAGES, &pages, 4);
+	memcpy(pl + SOF_PCMP_SIZE, &sz, 4);
+	memcpy(pl + SOF_PCMP_STREAM_TAG, &tag, 2);
+	bool ok = ipcTx(pm->cmd, pl, pm->size, NULL, 0);
+	SOFLOG("  #20 PCM_PARAMS (pt 0x%x, %u pages, tag %u): %s", (unsigned)phy, (unsigned)pages,
+	       (unsigned)tag, ok ? "ok" : "FAILED");
+	if (!ok) {
+		dmicHwStop();
+		return false;
+	}
+	mPcmParams = true;
+
+	/* trigger START: host DMA first, then IPC (sof_pcm_trigger, ipc_first=false) */
+	mLdp0 = hda32(mPpCap + 0x10 + 0x10 * (UInt32)s->index + 0x8);
+	hdaUpdate32(s->sd, SOF_SD_CTL_DMA_START | SOF_SD_INT_MASK, SOF_SD_CTL_DMA_START | SOF_SD_INT_MASK);
+	if (!replayOne(21)) {
+		dmicHwStop();
+		replayOne(23);
+		mPcmParams = false;
+		return false;
+	}
+	mCapturing = true;
+	mTicks = 0;
+	mLastLdp = 0xFFFFFFFFU;
+	SOFLOG("DMIC capture running: ctl %08x ldp0 %08x", (unsigned)hda32(s->sd), (unsigned)mLdp0);
+	return true;
+}
+
+/* trigger STOP: IPC first, then host DMA; then PCM_FREE. Buffers are kept. Caller holds mLock. */
 void VoodooHDASof::dmicStop()
 {
 	if (mCapturing) {
 		replayOne(22);
 		mCapturing = false;
 	}
-	dmicStreamCleanup();
+	if (mDmic.buf)
+		dmicHwStop();
 	if (mPcmParams) {
 		replayOne(23);
 		mPcmParams = false;
 	}
+}
+
+/* ---- public capture API (VoodooHDASofEngine) ---- */
+
+bool VoodooHDASof::captureReady()
+{
+	return mFwReady && mTopology && mDmic.buf;
+}
+
+bool VoodooHDASof::captureStart()
+{
+	IOLockLock(mLock);
+	bool ok = mDsp && dmicStart();
+	IOLockUnlock(mLock);
+	return ok;
+}
+
+void VoodooHDASof::captureStop()
+{
+	IOLockLock(mLock);
+	if (mDsp && mFwReady)
+		dmicStop();
+	IOLockUnlock(mLock);
+}
+
+/* current write position in the ring, in frames (host DMA linear position since start) */
+UInt32 VoodooHDASof::captureFrame()
+{
+	if (!mDsp || !mCapturing || mDmic.index < 0)
+		return 0;
+	UInt32 ldp = hda32(mPpCap + 0x10 + 0x10 * (UInt32)mDmic.index + 0x8);
+	return ((ldp - mLdp0) % SOF_DMIC_BUF_SIZE) / SOF_DMIC_FRAME_BYTES;
+}
+
+void *VoodooHDASof::captureBuffer()
+{
+	return mDmic.buf ? (void *)mDmic.buf->virtAddr : NULL;
 }
 
 /* integer 20*log10(x/32768) in tenths of dB (x > 0), ~0.3 dB accurate */
@@ -1561,14 +1643,20 @@ void VoodooHDASof::timerFired(OSObject *owner, IOTimerEventSource *sender)
 {
 	VoodooHDASof *self = OSDynamicCast(VoodooHDASof, owner);
 
-	if (!self || !self->mCapturing)
+	if (!self)
 		return;
+	IOLockLock(self->mLock);
+	if (!self->mCapturing) {
+		IOLockUnlock(self->mLock);
+		return;
+	}
 	self->mTicks++;
 	self->logCapture();
 	if (self->mTicks >= SOF_DMIC_LOG_SECONDS) {
 		SOFLOG("capture test finished after %u s, stopping", (unsigned)self->mTicks);
 		self->dmicStop();
 		self->teardownTopology();
+		IOLockUnlock(self->mLock);
 		if (self->mNsnpFallback) {
 			self->restoreDevc();
 			self->mPci->configWrite16(SOF_PCI_DEVC, self->mSavedDevc);
@@ -1576,6 +1664,7 @@ void VoodooHDASof::timerFired(OSObject *owner, IOTimerEventSource *sender)
 		}
 		return;
 	}
+	IOLockUnlock(self->mLock);
 	sender->setTimeoutMS(1000);
 }
 
@@ -1628,7 +1717,16 @@ bool VoodooHDASof::start()
 		return true;
 	}
 
-	/* M3b: DMIC capture + 1 s RMS log on our own workloop */
+	if (!dmicAlloc()) {
+		teardownTopology();
+		return true;
+	}
+	if (mStep >= kSofStepEngine) {
+		SOFLOG("ready for the capture engine (topology loaded, buffers allocated)");
+		return true;
+	}
+
+	/* M3b test: DMIC capture + 1 s RMS log on our own workloop */
 	if (!dmicStart()) {
 		dmicStop();
 		teardownTopology();
@@ -1661,7 +1759,11 @@ void VoodooHDASof::stop()
 		mWorkLoop->release();
 		mWorkLoop = NULL;
 	}
+	if (mLock)
+		IOLockLock(mLock);
 	powerDownDsp();
+	if (mLock)
+		IOLockUnlock(mLock);
 	if (mDspMap) {
 		mDspMap->release();
 		mDspMap = NULL;
@@ -1672,5 +1774,10 @@ void VoodooHDASof::stop()
 void VoodooHDASof::free()
 {
 	stop();
+	dmicFree();		/* only now: the capture engine may have used the buffer until here */
+	if (mLock) {
+		IOLockFree(mLock);
+		mLock = NULL;
+	}
 	OSObject::free();
 }
