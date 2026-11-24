@@ -657,7 +657,9 @@ bool VoodooHDASof::iccmaxStart()
 	hdaW32(s->sd + SOF_SD_CBL, s->size);
 	hdaW16(s->sd + SOF_SD_LVI, (UInt16)(s->frags - 1));
 	hdaUpdate32(mPpCap + SOF_PP_PPCTL, mask, mask);
-	hdaW8(SOF_VS_LTRP, (UInt8)((hda8(SOF_VS_LTRP) & ~SOF_VS_LTRP_GB_MASK) | SOF_LTRP_GB_VALUE_US));
+	/* snd_sof_dsp_update8(LTRP, GB_MASK, 95): the value is masked, as in Linux (95 & 0x3F) */
+	hdaW8(SOF_VS_LTRP, (UInt8)((hda8(SOF_VS_LTRP) & ~SOF_VS_LTRP_GB_MASK) |
+				   (SOF_LTRP_GB_VALUE_US & SOF_VS_LTRP_GB_MASK)));
 	hdaUpdate32(s->sd, SOF_SD_CTL_DMA_START, SOF_SD_CTL_DMA_START);
 	SOFDBG("ICCMAX started: SD%d ctl %08x", s->index, (unsigned)hda32(s->sd));
 	return true;
@@ -677,8 +679,7 @@ void VoodooHDASof::iccmaxCleanup()
 	hdaW32(s->sd + SOF_SD_BDLPU, 0);
 	hdaW32(s->sd, 0);
 	hdaUpdate32(mPpCap + SOF_PP_PPCTL, 1U << s->index, 0);
-	hdaW8(SOF_VS_LTRP, (UInt8)((hda8(SOF_VS_LTRP) & ~SOF_VS_LTRP_GB_MASK) |
-				   (mSavedLtrpGb & SOF_VS_LTRP_GB_MASK)));
+	hdaW8(SOF_VS_LTRP, mSavedLtrp);	/* restore the whole original byte */
 	streamFree(s);
 }
 
@@ -810,7 +811,7 @@ bool VoodooHDASof::bootFirmware()
 	clockPowerGating(false);
 
 	/* ICCMAX workaround stream */
-	mSavedLtrpGb = hda8(SOF_VS_LTRP) & SOF_VS_LTRP_GB_MASK;
+	mSavedLtrp = hda8(SOF_VS_LTRP);
 	if (!iccmaxStart()) {
 		abortBoot("ICCMAX stream");
 		return false;

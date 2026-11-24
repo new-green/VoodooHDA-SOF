@@ -185,7 +185,7 @@ private:
 	bool mFwReady;
 	bool mGatingDisabled;
 	bool mSavedEm2L1;
-	UInt8 mSavedLtrpGb;
+	UInt8 mSavedLtrp;
 	SofStream mLoader;		/* code loader (playback) */
 	SofStream mIccmax;		/* ICCMAX workaround (capture) */
 
