@@ -675,6 +675,11 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 		goto done;
 	}
 
+	/* SOF: remember the firmware-provided config space before VoodooHDA modifies it */
+	for (int i = 0; i < 64; i++)
+		mOrigPciCfg[i] = mPciNub->configRead32((UInt8)(i * 4));
+	mOrigPciCfgValid = true;
+
 	config = mPciNub->configRead16(kIOPCIConfigCommand);
 	oldConfig = config;
 	config |= (kIOPCICommandBusMaster | kIOPCICommandMemorySpace); // | kIOPCICommandMemWrInvalidate); //Slice

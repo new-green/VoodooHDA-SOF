@@ -305,15 +305,34 @@ void VoodooHDASof::dumpStreams()
 	}
 }
 
+/* Config space as left by firmware (captured before VoodooHDA's writes) vs now. */
+void VoodooHDASof::dumpConfig()
+{
+	if (!mDev->mOrigPciCfgValid) {
+		SOFLOG("cfg: original config space not captured");
+		return;
+	}
+	const UInt32 *o = mDev->mOrigPciCfg;
+	for (int i = 0x40 / 4; i < 64; i += 8)
+		SOFLOG("cfg fw  %02x: %08x %08x %08x %08x %08x %08x %08x %08x", i * 4,
+		       (unsigned)o[i], (unsigned)o[i + 1], (unsigned)o[i + 2], (unsigned)o[i + 3],
+		       (unsigned)o[i + 4], (unsigned)o[i + 5], (unsigned)o[i + 6], (unsigned)o[i + 7]);
+	for (int i = 0; i < 64; i++) {
+		UInt32 now = mPci->configRead32((UInt8)(i * 4));
+		if (now != o[i])
+			SOFLOG("cfg diff %02x: fw %08x -> now %08x", i * 4, (unsigned)o[i], (unsigned)now);
+	}
+}
+
 void VoodooHDASof::dumpState(const char *when)
 {
 	SOFLOG("---- state (%s) ----", when);
 	SOFLOG("pci: cmd %04x class %08x PGCTL(0x44) %08x CGCTL(0x48) %08x",
 	       mPci->configRead16(kIOPCIConfigCommand), (unsigned)mPci->configRead32(kIOPCIConfigRevisionID),
 	       (unsigned)mPci->configRead32(SOF_PCI_PGCTL), (unsigned)mPci->configRead32(SOF_PCI_CGCTL));
-	SOFLOG("hda: GCAP %04x GCTL %08x INTCTL %08x INTSTS %08x EM2 %08x LTRP %02x",
+	SOFLOG("hda: GCAP %04x GCTL %08x INTCTL %08x INTSTS %08x EM2 %08x LTRP %02x D0I3C %02x",
 	       (unsigned)hda16(0x00), (unsigned)hda32(0x08), (unsigned)hda32(0x20), (unsigned)hda32(0x24),
-	       (unsigned)hda32(SOF_VS_EM2), (unsigned)hda8(SOF_VS_LTRP));
+	       (unsigned)hda32(SOF_VS_EM2), (unsigned)hda8(SOF_VS_LTRP), (unsigned)hda8(SOF_VS_D0I3C));
 	if (mPpCap)
 		SOFLOG("pp:  PPCH %08x PPCTL %08x PPSTS %08x", (unsigned)hda32(mPpCap),
 		       (unsigned)hda32(mPpCap + SOF_PP_PPCTL), (unsigned)hda32(mPpCap + SOF_PP_PPSTS));
@@ -925,6 +944,21 @@ bool VoodooHDASof::bootFirmware()
 		return false;
 	}
 
+	/*
+	 * VoodooHDA clears 0x44[2:0] ("TCSEL -> TC0"), but on SKL+ 0x44 is PGCTL (Linux sets
+	 * AZX_DCAPS_NO_TCSEL there and SOF never writes it). Give the DSP the firmware's value back.
+	 */
+	if (mDev->mOrigPciCfgValid) {
+		UInt32 fw44 = mDev->mOrigPciCfg[SOF_PCI_PGCTL / 4], now44 = mPci->configRead32(SOF_PCI_PGCTL);
+		if (fw44 != now44) {
+			mPci->configWrite32(SOF_PCI_PGCTL, fw44);
+			SOFLOG("PGCTL restored to firmware value: %08x -> %08x (reads %08x)", (unsigned)now44,
+			       (unsigned)fw44, (unsigned)mPci->configRead32(SOF_PCI_PGCTL));
+		} else {
+			SOFLOG("PGCTL unchanged by VoodooHDA (%08x)", (unsigned)now44);
+		}
+	}
+
 	/* pre_fw_run */
 	clockPowerGating(false);
 	mSavedLtrp = hda8(SOF_VS_LTRP);
@@ -936,8 +970,8 @@ bool VoodooHDASof::bootFirmware()
 	 * Variant 2: same streams, without the ICCMAX stream.
 	 */
 	bool entered = false;
-	for (int variant = 1; variant <= 2 && !entered; variant++) {
-		bool useIccmax = (variant == 1);
+	for (int variant = 1; variant <= 1 && !entered; variant++) {
+		bool useIccmax = true;
 		mLow4G = false;
 		mLinuxIntBits = true;
 		SOFLOG("==== variant %d: Linux streams%s ====", variant, useIccmax ? " + ICCMAX" : ", no ICCMAX");
@@ -1042,6 +1076,7 @@ bool VoodooHDASof::start()
 	if (!mapDsp())
 		return false;
 	dumpStreams();
+	dumpConfig();
 	dumpState("M1 probe");
 
 	if (mStep <= kSofStepProbe) {

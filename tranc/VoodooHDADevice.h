@@ -438,6 +438,8 @@ public:
 
 	/* Intel SOF DSP (DMIC) support, only with -voodoosof */
 	class VoodooHDASof *mSof;
+	UInt32 mOrigPciCfg[64];		/* config space 0x00-0xFF as left by firmware */
+	bool mOrigPciCfgValid;
 
 	/* Dynamic HDMI engine management */
 	struct HDMIEngineSlot {

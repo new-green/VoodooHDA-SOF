@@ -58,6 +58,7 @@ struct _DmaMemory;
 #define SOF_SPB_SPIB(i)			((UInt32)(0x08 + 0x08 * (i)))
 #define SOF_VS_EM2			0x1030
 #define SOF_VS_EM2_L1SEN		(1U << 13)
+#define SOF_VS_D0I3C			0x104A
 #define SOF_VS_LTRP			0x1048
 #define SOF_VS_LTRP_GB_MASK		0x3F
 #define SOF_LTRP_GB_VALUE_US		95
@@ -194,6 +195,7 @@ private:
 	bool initWithDevice(VoodooHDADevice *device);
 	bool mapDsp();
 	void findCaps();
+	void dumpConfig();
 	void dumpState(const char *when);
 	void dumpStreams();
 
