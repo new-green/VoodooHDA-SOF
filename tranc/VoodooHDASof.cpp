@@ -850,6 +850,16 @@ bool VoodooHDASof::waitFwReady()
 	for (size_t i = 0; i < sizeof words / sizeof words[0]; i++)
 		words[i] = dsp32(SOF_DSP_MBOX_UPLINK_OFFSET + (UInt32)i * 4);
 
+	/* ipc3_fw_ready(): the ext data (mailbox windows) is parsed before the message is acked */
+	if (mStep >= kSofStepIpc && !parseExtData()) {
+		UInt32 b = SOF_DSP_MBOX_UPLINK_OFFSET + (UInt32)sizeof(SofIpcFwReady);
+		for (UInt32 i = 0; i < 64; i += 8)
+			SOFLOG("ext raw +%03x: %08x %08x %08x %08x %08x %08x %08x %08x", (unsigned)(i * 4),
+			       (unsigned)dsp32(b + i * 4), (unsigned)dsp32(b + i * 4 + 4), (unsigned)dsp32(b + i * 4 + 8),
+			       (unsigned)dsp32(b + i * 4 + 12), (unsigned)dsp32(b + i * 4 + 16), (unsigned)dsp32(b + i * 4 + 20),
+			       (unsigned)dsp32(b + i * 4 + 24), (unsigned)dsp32(b + i * 4 + 28));
+	}
+
 	/* cnl_ipc_host_done(): clear BUSY (write 1), then signal DONE */
 	dspUpdate32(SOF_CNL_HIPCTDR, SOF_IPC_BUSY, SOF_IPC_BUSY);
 	dspUpdate32(SOF_CNL_HIPCTDA, SOF_IPC_DONE, SOF_IPC_DONE);
@@ -1537,9 +1547,11 @@ bool VoodooHDASof::start()
 	if (!ok || mStep < kSofStepIpc || !mFwReady)
 		return ok;
 
-	/* M3a: mailbox + topology */
-	if (!parseExtData())
+	/* M3a: mailbox (parsed at FW_READY) + topology */
+	if (!mHostBoxSize || !mDspBoxSize) {
+		SOFLOG("no mailbox windows, IPC not possible");
 		return true;		/* DSP stays booted; no IPC */
+	}
 	SOFLOG("replaying topology (#0-19)");
 	mTopology = true;		/* partial topology is freed as well */
 	if (!replay(0, 19)) {
