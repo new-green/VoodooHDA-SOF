@@ -186,6 +186,8 @@ private:
 	bool mGatingDisabled;
 	bool mSavedEm2L1;
 	UInt8 mSavedLtrp;
+	bool mLow4G;			/* experiment: DMA buffers below 4 GB */
+	bool mLinuxIntBits;		/* experiment: SD int enables + BDL IOC exactly like Linux */
 	SofStream mLoader;		/* code loader (playback) */
 	SofStream mIccmax;		/* ICCMAX workaround (capture) */
 
@@ -221,6 +223,7 @@ private:
 
 	/* streams (hda-stream.c, hda-loader.c) */
 	bool pickStreams();
+	struct _DmaMemory *allocDma(UInt32 size, const char *what);
 	bool streamAlloc(SofStream *s, UInt32 size, const char *what);
 	void streamFree(SofStream *s);
 	int streamSetupBdl(SofStream *s);
@@ -234,6 +237,7 @@ private:
 	/* boot (hda-loader.c, cnl.c, ipc3.c) */
 	bool clDspInit(int tag);
 	bool bootFirmware();
+	bool traceCopy(UInt32 *lastFsr);
 	bool waitFwReady();
 	void abortBoot(const char *why);
 	void powerDownDsp();

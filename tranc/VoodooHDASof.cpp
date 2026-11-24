@@ -483,18 +483,53 @@ bool VoodooHDASof::pickStreams()
 	return true;
 }
 
+/*
+ * Physically contiguous, uncached DMA memory (same as VoodooHDADevice::allocateDmaMemory, so
+ * freeDmaMemory() releases it), optionally below 4 GB. Verifies contiguity.
+ */
+DmaMemory *VoodooHDASof::allocDma(UInt32 size, const char *what)
+{
+	mach_vm_address_t mask = mLow4G ? 0xFFFFFF80ULL : ~0x7FULL;
+	IOByteCount seg = 0;
+	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		kIOMemoryPhysicallyContiguous | kIODirectionInOut | kIOMapInhibitCache, size, mask);
+
+	if (!md)
+		return NULL;
+	if (md->prepare() != kIOReturnSuccess) {
+		md->release();
+		return NULL;
+	}
+	UInt64 phys = md->getPhysicalSegment(0, &seg, 0);
+	if (!phys || seg < size) {
+		SOFLOG("error: %s not contiguous (phys 0x%llx seg 0x%llx size 0x%x)", what,
+		       (unsigned long long)phys, (unsigned long long)seg, (unsigned)size);
+		md->complete();
+		md->release();
+		return NULL;
+	}
+	DmaMemory *d = new DmaMemory;
+	d->description = what;
+	d->md = md;
+	d->size = size;
+	d->physAddr = phys;
+	d->virtAddr = reinterpret_cast<IOVirtualAddress>(md->getBytesNoCopy());
+	bzero((void *)d->virtAddr, size);
+	return d;
+}
+
 bool VoodooHDASof::streamAlloc(SofStream *s, UInt32 size, const char *what)
 {
 	s->size = size;
 	s->frags = 0;
-	s->buf = mDev->allocateDmaMemory(size, what, kIOMapInhibitCache);
-	s->bdl = mDev->allocateDmaMemory(SOF_BDL_SIZE, "SOF BDL", kIOMapInhibitCache);
+	s->buf = allocDma(size, what);
+	s->bdl = allocDma(SOF_BDL_SIZE, "SOF BDL");
 	if (!s->buf || !s->bdl) {
 		SOFLOG("error: DMA alloc failed for %s (%u bytes)", what, (unsigned)size);
 		streamFree(s);
 		return false;
 	}
-	SOFDBG("%s: buf phys 0x%llx size 0x%x, bdl phys 0x%llx", what,
+	SOFLOG("%s: buf phys 0x%llx size 0x%x, bdl phys 0x%llx", what,
 	       (unsigned long long)s->buf->physAddr, (unsigned)size, (unsigned long long)s->bdl->physAddr);
 	return true;
 }
@@ -513,7 +548,8 @@ void VoodooHDASof::streamFree(SofStream *s)
 
 /*
  * hda_dsp_stream_setup_bdl(): the buffer is physically contiguous; split it into
- * two equal periods like the reference trace ("periods: 2"). No IOC.
+ * two equal periods exactly like Linux does for a single contiguous area ("periods: 2").
+ * IOC per period only in the Linux-identical variant (no_ipc_position=1 -> ioc=1).
  */
 int VoodooHDASof::streamSetupBdl(SofStream *s)
 {
@@ -525,7 +561,7 @@ int VoodooHDASof::streamSetupBdl(SofStream *s)
 		bdl[i].addrLo = (UInt32)addr;
 		bdl[i].addrHi = (UInt32)(addr >> 32);
 		bdl[i].size = (i == 1) ? s->size - half : half;
-		bdl[i].ioc = 0;
+		bdl[i].ioc = mLinuxIntBits ? 1 : 0;
 	}
 	s->frags = 2;
 	return s->frags;
@@ -589,7 +625,9 @@ bool VoodooHDASof::loaderPrepare(const UInt8 *fw, UInt32 fwSize)
 	hdaW16(s->sd + SOF_SD_LVI, (UInt16)(s->frags - 1));
 	hdaW32(s->sd + SOF_SD_BDLPL, (UInt32)s->bdl->physAddr);
 	hdaW32(s->sd + SOF_SD_BDLPU, (UInt32)(s->bdl->physAddr >> 32));
-	/* no SD interrupt enables (see header comment) */
+	/* SD interrupt enables only in the Linux-identical variant; INTCTL stays off either way */
+	if (mLinuxIntBits)
+		hdaUpdate32(s->sd, SOF_SD_INT_MASK, SOF_SD_INT_MASK);
 
 	if (mSpbCap) {
 		hdaUpdate32(mSpbCap + SOF_SPB_SPBFCCTL, mask, mask);
@@ -609,7 +647,8 @@ bool VoodooHDASof::loaderTrigger(bool start)
 	UInt32 v;
 
 	if (start) {
-		hdaUpdate32(s->sd, SOF_SD_CTL_DMA_START, SOF_SD_CTL_DMA_START);
+		UInt32 bits = SOF_SD_CTL_DMA_START | (mLinuxIntBits ? SOF_SD_INT_MASK : 0);
+		hdaUpdate32(s->sd, bits, bits);
 		return true;
 	}
 	hdaUpdate32(s->sd, SOF_SD_CTL_DMA_START | SOF_SD_INT_MASK, 0);
@@ -778,6 +817,62 @@ bool VoodooHDASof::waitFwReady()
 	return true;
 }
 
+/*
+ * Wait for FW_ENTERED while the code loader DMA runs, logging every change of ROM status,
+ * SD status and the host DMA position (PPHC). Gives up early when the ROM halts.
+ */
+bool VoodooHDASof::traceCopy(UInt32 *lastFsr)
+{
+	UInt32 pphc = mPpCap + 0x10 + 0x10 * (UInt32)mLoader.index;
+	UInt32 fsr = 0, prevFsr = 0xFFFFFFFFU, prevSts = 0xFFFFFFFFU, prevLdp = 0xFFFFFFFFU;
+	uint64_t t0, t, ns;
+	int lines = 0;
+	bool ok = false;
+
+	clock_get_uptime(&t0);
+	for (;;) {
+		fsr = dsp32(SOF_SRAM_ROM_STATUS);
+		UInt32 sts = hda8(mLoader.sd + SOF_SD_STS);
+		UInt32 ldp = hda32(pphc + 0x8);
+		clock_get_uptime(&t);
+		absolutetime_to_nanoseconds(t - t0, &ns);
+		UInt32 us = (UInt32)(ns / 1000);
+
+		bool changed = fsr != prevFsr || sts != prevSts;
+		bool ldpMoved = ldp != prevLdp && (us < 2000 || (ldp >> 15) != (prevLdp >> 15));
+		if ((changed || ldpMoved) && lines < 60) {
+			SOFLOG("  +%6u us: ROM %08x err %08x | SD%d sts %02x ctl %08x | PPHC llp %08x ldp %08x | SPIB %08x",
+			       (unsigned)us, (unsigned)fsr, (unsigned)dsp32(SOF_SRAM_ROM_ERROR), mLoader.index,
+			       (unsigned)sts, (unsigned)hda32(mLoader.sd), (unsigned)hda32(pphc),
+			       (unsigned)ldp, mSpbCap ? (unsigned)hda32(mSpbCap + SOF_SPB_SPIB(mLoader.index)) : 0U);
+			lines++;
+		}
+		prevFsr = fsr;
+		prevSts = sts;
+		prevLdp = ldp;
+
+		if (SOF_FSR_STATE(fsr) == SOF_FSR_FW_ENTERED) {
+			ok = true;
+			break;
+		}
+		if (fsr & 0x80000000U) {	/* FSR_HALTED */
+			SOFLOG("  ROM halted after %u us", (unsigned)us);
+			break;
+		}
+		if (us >= SOF_BASEFW_TIMEOUT_US) {
+			SOFLOG("  timeout after %u us", (unsigned)us);
+			break;
+		}
+		if (us < 200000)
+			IODelay(50);
+		else
+			IOSleep(1);
+	}
+	if (lastFsr)
+		*lastFsr = fsr;
+	return ok;
+}
+
 /* hda_dsp_cl_boot_firmware_iccmax() + wait for FW_READY + post_fw_run */
 bool VoodooHDASof::bootFirmware()
 {
@@ -809,52 +904,67 @@ bool VoodooHDASof::bootFirmware()
 
 	/* pre_fw_run */
 	clockPowerGating(false);
-
-	/* ICCMAX workaround stream */
 	mSavedLtrp = hda8(SOF_VS_LTRP);
-	if (!iccmaxStart()) {
-		abortBoot("ICCMAX stream");
-		return false;
-	}
 
-	if (!loaderPrepare(fw + payload, fwSize - payload)) {
-		abortBoot("code loader stream");
-		return false;
-	}
+	/*
+	 * Variant A: buffers anywhere, no SD interrupt enables.
+	 * Variant B (only if A fails at FW download): buffers below 4 GB, SD interrupt enable bits
+	 * and BDL IOC exactly as Linux (INTCTL still off, so no host interrupt).
+	 */
+	bool entered = false;
+	for (int variant = 0; variant < 2 && !entered; variant++) {
+		mLow4G = mLinuxIntBits = (variant == 1);
+		SOFLOG("==== variant %c: %s ====", 'A' + variant,
+		       variant ? "below 4 GB + Linux SD int bits/IOC" : "default");
 
-	for (attempt = 1; attempt <= SOF_FW_BOOT_ATTEMPTS; attempt++) {
-		SOFLOG("core 0 / ROM init, attempt %d", attempt);
-		if (clDspInit(mLoader.tag))
-			break;
-	}
-	if (attempt > SOF_FW_BOOT_ATTEMPTS) {
-		abortBoot("ROM init failed");
-		return false;
-	}
+		/* ICCMAX workaround stream */
+		if (!iccmaxStart()) {
+			abortBoot("ICCMAX stream");
+			return false;
+		}
+		if (!loaderPrepare(fw + payload, fwSize - payload)) {
+			abortBoot("code loader stream");
+			return false;
+		}
 
-	if (mStep < kSofStepFw) {
-		SOFLOG("step %u reached (ROM init OK), powering DSP down again", (unsigned)mStep);
-		dumpState("ROM init");
-		abortBoot("voodoosofstep");
-		dumpState("after power down");
-		return true;
-	}
+		for (attempt = 1; attempt <= SOF_FW_BOOT_ATTEMPTS; attempt++) {
+			SOFLOG("core 0 / ROM init, attempt %d", attempt);
+			if (clDspInit(mLoader.tag))
+				break;
+		}
+		if (attempt > SOF_FW_BOOT_ATTEMPTS) {
+			abortBoot("ROM init failed");
+			return false;
+		}
 
-	/* hda_cl_copy_fw() */
-	SOFLOG("code loader DMA starting");
-	loaderTrigger(true);
-	bool entered = pollDsp(SOF_SRAM_ROM_STATUS, 0xFFFFFFU, SOF_FSR_FW_ENTERED, SOF_BASEFW_TIMEOUT_US, &v);
-	UInt32 lpib = hda32(mLoader.sd + SOF_SD_LPIB);
-	bool stopped = loaderTrigger(false);
+		if (mStep < kSofStepFw) {
+			SOFLOG("step %u reached (ROM init OK), powering DSP down again", (unsigned)mStep);
+			dumpState("ROM init");
+			abortBoot("voodoosofstep");
+			dumpState("after power down");
+			return true;
+		}
+
+		/* hda_cl_copy_fw() */
+		SOFLOG("code loader DMA starting");
+		loaderTrigger(true);
+		entered = traceCopy(&v);
+		bool stopped = loaderTrigger(false);
+		if (!entered) {
+			SOFLOG("error: no FW_ENTERED, ROM_STATUS %08x ROM_ERROR %08x", (unsigned)v,
+			       (unsigned)dsp32(SOF_SRAM_ROM_ERROR));
+			dumpState("FW download failed");
+			coreResetPowerDown(SOF_CORE0);
+			loaderCleanup();
+			iccmaxCleanup();
+			continue;
+		}
+		SOFLOG("FW_ENTERED: ROM_STATUS %08x, DMA %s", (unsigned)v, stopped ? "stopped" : "stop FAILED");
+	}
 	if (!entered) {
-		SOFLOG("error: FW_ENTERED timeout, ROM_STATUS %08x ROM_ERROR %08x LPIB %08x", (unsigned)v,
-		       (unsigned)dsp32(SOF_SRAM_ROM_ERROR), (unsigned)lpib);
-		dumpState("FW_ENTERED timeout");
-		abortBoot("firmware download");
+		abortBoot("firmware download (both variants)");
 		return false;
 	}
-	SOFLOG("FW_ENTERED: ROM_STATUS %08x LPIB %08x, DMA %s", (unsigned)v, (unsigned)lpib,
-	       stopped ? "stopped" : "stop FAILED");
 
 	loaderCleanup();
 	iccmaxCleanup();
