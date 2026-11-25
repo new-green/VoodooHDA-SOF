@@ -15,7 +15,9 @@
  *   voodoosofstep=N     stop after milestone step N (default: highest implemented)
  *                       1 = read-only probe, 2 = DSP power-up + ROM init (then power down again),
  *                       3 = full firmware load until FW_READY, 4 = + IPC topology replay (and free),
- *                       5 = normal: topology loaded, "Dahili Mikrofon" engines start/stop capture
+ *                       5 = normal: topology loaded, the capture engines start/stop the DMIC
+ *   voodoosofnr=0|1|2   noise-reduced second input device: none / on, 50 % (default) / on, 100 %
+ *   voodoosofpm=0       keep the DSP in D0i0 while idle (default: D0i3 5 s after the last capture)
  */
 
 #ifndef _VOODOO_HDA_SOF_H
@@ -192,15 +194,15 @@ struct _DmaMemory;
 
 /* Milestones (voodoosofstep) */
 enum {
-	kSofStepProbe = 1,	/* M1: map BAR4, read-only register dump */
-	kSofStepRom = 2,	/* M2a: core 0 power-up + ROM init, then power down again */
-	kSofStepFw = 3,		/* M2b: code loader DMA, FW_ENTERED, FW_READY */
-	kSofStepIpc = 4,	/* M3a: mailbox windows, replay topology #0-19, free it again #24-31 */
-	kSofStepEngine = 5,	/* M4: topology stays loaded, "Dahili Mikrofon" engines drive capture */
+	kSofStepProbe = 1,	/* map BAR4, read-only register dump */
+	kSofStepRom = 2,	/* core 0 power-up + ROM init, then power down again */
+	kSofStepFw = 3,		/* code loader DMA, FW_ENTERED, FW_READY */
+	kSofStepIpc = 4,	/* mailbox windows, replay topology #0-19, free it again #24-31 */
+	kSofStepEngine = 5,	/* topology stays loaded, the capture engines drive the DMIC */
 	kSofStepMax = kSofStepEngine
 };
 
-/* IPC3 replay list generated at build time from trace/ipc-replay.json */
+/* IPC3 replay list generated at build time from sof/ipc-replay.json */
 struct SofReplayMsg {
 	UInt32 cmd;
 	UInt32 size;		/* including the 8-byte sof_ipc_cmd_hdr */
@@ -329,7 +331,7 @@ private:
 	void sspSetConsumer();
 
 	/* streams (hda-stream.c, hda-loader.c) */
-	bool pickStreams(bool linuxStreams);
+	bool pickStreams();
 	struct _DmaMemory *allocDma(UInt32 size, const char *what);
 	bool streamAlloc(SofStream *s, UInt32 size, const char *what);
 	void streamFree(SofStream *s);

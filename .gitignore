@@ -32,3 +32,5 @@
 *.app
 .DS_Store
 build/
+tools/sof-test/rec
+tools/sof-test/sofctl

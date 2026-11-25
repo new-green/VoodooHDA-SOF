@@ -2,17 +2,19 @@
 /*
  * VoodooHDASof — see VoodooHDASof.h.
  *
- * M1 (step 1): map BAR4, read-only register dump.
- * M2 (steps 2-3): DSP cold boot, port of hda_dsp_cl_boot_firmware_iccmax():
+ * Boot (once, at VoodooHDA start): port of hda_dsp_cl_boot_firmware_iccmax():
  *   pre_fw_run (clock/power gating off) -> ICCMAX capture stream -> code loader stream
  *   -> cl_dsp_init (core 0 power up, ROM IPC purge, run, ROM INIT_DONE)
  *   -> code loader DMA -> FW_ENTERED -> cleanup -> FW_READY (IPC3) -> post_fw_run.
+ * Then the IPC3 topology captured from Linux is replayed (sof_replay.cpp, generated from
+ * sof/ipc-replay.json) and the DMIC host stream is set up; VoodooHDASofEngine starts and
+ * stops the PCM. While nobody captures, the DSP idles in D0i3.
  *
  * Deliberate differences from Linux, to stay out of VoodooHDA's interrupt path:
- *   - no stream interrupt enables (SD_CTL int bits, INTCTL), no PPCTL.PIE, no HIPCCTL/ADSPIC:
- *     everything is polled.
- *   - SOF uses the highest-numbered input/output stream descriptors, which VoodooHDA
- *     does not use (VoodooHDA allocates from SD0 / SD(ISS) upwards).
+ *   - no INTCTL, PPCTL.PIE, HIPCCTL or ADSPIC: IPC and DMA positions are polled.
+ *   - the code loader and ICCMAX streams borrow VoodooHDA's (idle at boot) SD(ISS) and SD0
+ *     with Linux's tags, the only combination the ROM accepted; the DMIC host stream uses
+ *     the highest input SD, which VoodooHDA never uses.
  */
 
 #include "VoodooHDASof.h"
@@ -247,7 +249,7 @@ bool VoodooHDASof::pollDsp(UInt32 off, UInt32 mask, UInt32 want, UInt32 timeoutU
 }
 
 /* ============================================================================ */
-/* M1: probe                                                                    */
+/* probe                                                                        */
 /* ============================================================================ */
 
 bool VoodooHDASof::mapDsp()
@@ -492,7 +494,8 @@ void VoodooHDASof::sspSetConsumer()
  * first playback SD (code loader), both tag 1. These belong to VoodooHDA, so they are only
  * borrowed while idle; VoodooHDA resets and fully reprograms an SD on every channel start.
  */
-bool VoodooHDASof::pickStreams(bool linuxStreams)
+/* Linux's code loader / ICCMAX streams: SD(ISS) tag 1 and SD0 tag 1, borrowed while idle */
+bool VoodooHDASof::pickStreams()
 {
 	int iss = mDev->mInStreamsSup, oss = mDev->mOutStreamsSup;
 
@@ -502,17 +505,10 @@ bool VoodooHDASof::pickStreams(bool linuxStreams)
 	}
 	mIccmax.playback = false;
 	mLoader.playback = true;
-	if (linuxStreams) {
-		mIccmax.index = 0;
-		mIccmax.tag = 1;
-		mLoader.index = iss;
-		mLoader.tag = 1;
-	} else {
-		mIccmax.index = iss - 1;
-		mIccmax.tag = iss;
-		mLoader.index = iss + oss - 1;
-		mLoader.tag = oss;
-	}
+	mIccmax.index = 0;
+	mIccmax.tag = 1;
+	mLoader.index = iss;
+	mLoader.tag = 1;
 	mIccmax.sd = SOF_SD_OFFSET(mIccmax.index);
 	mLoader.sd = SOF_SD_OFFSET(mLoader.index);
 
@@ -520,11 +516,6 @@ bool VoodooHDASof::pickStreams(bool linuxStreams)
 		int sd = mDev->mChannels[i].off >> 5;
 		if (sd != mIccmax.index && sd != mLoader.index)
 			continue;
-		if (!linuxStreams) {
-			SOFLOG("error: SD%d is used by VoodooHDA channel %d", sd, i);
-			mIccmax.index = mLoader.index = -1;
-			return false;
-		}
 		UInt32 ctl = hda32(SOF_SD_OFFSET(sd));
 		if (ctl & SOF_SD_CTL_DMA_START) {
 			SOFLOG("error: SD%d (VoodooHDA channel %d) is running (ctl %08x), not borrowing it",
@@ -1013,7 +1004,7 @@ bool VoodooHDASof::bootFirmware()
 	 */
 	mLow4G = false;
 	mLinuxIntBits = true;
-	if (!pickStreams(true)) {
+	if (!pickStreams()) {
 		abortBoot("no streams");
 		return false;
 	}
@@ -1357,7 +1348,7 @@ bool VoodooHDASof::sendCtrl(int replayIdx, UInt32 value, const char *what)
 }
 
 /* ============================================================================ */
-/* M3/M4: DMIC capture                                                          */
+/* DMIC capture                                                                 */
 /* ============================================================================ */
 
 /* freeDmaMemory() equivalent that does not need the (possibly gone) VoodooHDADevice */
@@ -1663,7 +1654,7 @@ bool VoodooHDASof::captureReady()
 	return mFwReady && mTopology && mDmic.buf;
 }
 
-/* both engines ("Dahili Mikrofon" and the noise-reduced one) share the one DMIC stream */
+/* both engines (raw and noise-reduced) share the one DMIC stream */
 bool VoodooHDASof::captureStart()
 {
 	IOLockLock(mLock);
@@ -1756,7 +1747,7 @@ bool VoodooHDASof::start()
 	if (!ok || mStep < kSofStepIpc || !mFwReady)
 		return ok;
 
-	/* M3a: mailbox (parsed at FW_READY) + topology */
+	/* mailbox (parsed at FW_READY) + topology */
 	if (!mHostBoxSize || !mDspBoxSize) {
 		SOFLOG("no mailbox windows, IPC not possible");
 		return true;		/* DSP stays booted; no IPC */

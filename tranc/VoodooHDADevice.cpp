@@ -866,8 +866,8 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 			mSof->release();
 			mSof = NULL;
 		}
-		/* M4: publish the DMIC capture engine ("Dahili Mikrofon") and, unless voodoosofnr=0,
-		 * a noise-reduced second one on the same stream ("Dahili Mikrofon (Gürültü Azaltma)") */
+		/* publish the DMIC capture engine ("Internal Microphone") and, unless voodoosofnr=0,
+		 * a noise-reduced second one on the same stream ("Internal Microphone (Noise Reduction)") */
 		if (mSof && mSof->captureReady()) {
 			VoodooHDASofEngine *sofEngine = new VoodooHDASofEngine;
 			VoodooHDASofEngine *nrEngine = NULL;

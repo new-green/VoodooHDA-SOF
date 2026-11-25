@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 /*
  * VoodooHDASofEngine — IOAudioEngine for the Intel SOF DSP digital microphones
- * ("Dahili Mikrofon"). Capture only, 48 kHz / 2 ch / S16LE. The sample buffer is the
+ * ("Internal Microphone"). Capture only, 48 kHz / 2 ch / S16LE. The sample buffer is the
  * DMIC host DMA ring owned by VoodooHDASof; the position comes from the host DMA linear
  * position (no interrupts), and the buffer-wrap time stamps are taken from a poll timer.
  */

@@ -1,8 +1,8 @@
 RNNoise v0.1.1 ("last classic version", https://github.com/xiph/rnnoise tag v0.1.1,
 commit of the tag), BSD-3-Clause (see COPYING), built into the kernel for the
-"Dahili Mikrofon (Gürültü Azaltma)" input sources of VoodooHDASofEngine.
+noise-reduced input device ("Internal Microphone (Noise Reduction)") of VoodooHDASofEngine.
 
-Kernel changes (output verified bit-identical to the stock library on trace/dmic.wav):
+Kernel changes (output verified bit-identical to the stock library on a DMIC recording):
   - no libc/libm: rnn_kern.h provides sqrt/fabs (SSE), floor, log10 (atanh series),
     sin/cos (Taylor; only for the one-time FFT twiddles / window / DCT tables);
     FFT state comes from a static arena (rnnk_alloc), nothing is freed
@@ -10,6 +10,6 @@ Kernel changes (output verified bit-identical to the stock library on trace/dmic
     static (single instance, the caller serializes); deepest call chain ~2 KB
   - GRU states inline in DenoiseState instead of calloc; rnnoise_create/destroy,
     rnn_reader.c (FILE model loading), the TRAINING main() and stdio removed
-  - band gains can be floored (rnnk_gain_floor) for a "light" mode; applied after
-    the gain smoothing, so 0 = stock behaviour
-  - wrapper API: rnnoise_kern.h (rnnk_init / rnnk_set_floor / rnnk_process)
+  - band gains can be floored (rnnk_gain_floor, the "strength" slider: floor
+    10^(-0.02 * %), 100 % = 0 = stock behaviour); applied after the gain smoothing
+  - wrapper API: rnnoise_kern.h (rnnk_init / rnnk_set_floor / rnnk_reset / rnnk_process)

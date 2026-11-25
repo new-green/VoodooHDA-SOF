@@ -1,8 +1,8 @@
-// SofMicBar — menu bar slider for the noise reduction strength of "Dahili Mikrofon (Gürültü Azaltma)".
+// SofMicBar — menu bar slider for the noise reduction strength of "Internal Microphone (Noise Reduction)".
 // Part of the VoodooHDA SOF port. Talks to the VoodooHDASofEngine through its "SofNrStrength"
 // registry property (0..100 %, 50 = -20 dB band gain floor, 100 = no floor).
 // Mute: the CoreAudio input mute of the SOF devices (the kext sends it to the DSP and keeps both
-// "Dahili Mikrofon" devices in sync); macOS Sound settings has no input mute button.
+// microphone devices in sync); macOS Sound settings has no input mute button.
 import AppKit
 import IOKit
 import CoreAudio
@@ -10,6 +10,13 @@ import CoreAudio
 let kKey = "SofNrStrength"
 let kDefaultsKey = "nrStrength"
 let kAgentLabel = "local.voodoohda.sofmicbar"
+
+// UI language: `defaults write local.voodoohda.sofmicbar language tr|en`, otherwise Turkish when it
+// is the user's first preferred language, English everywhere else
+let isTurkish = (UserDefaults.standard.string(forKey: "language")
+                 ?? Locale.preferredLanguages.first ?? "").hasPrefix("tr")
+func L(_ tr: String, _ en: String) -> String { isTurkish ? tr : en }
+func pct(_ p: Int) -> String { isTurkish ? "%\(p)" : "\(p)%" }
 
 func findNrEngine() -> io_service_t? {
     var iter: io_iterator_t = 0
@@ -84,8 +91,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let slider = NSSlider(value: 50, minValue: 0, maxValue: 100, target: nil, action: nil)
     let valueLabel = NSTextField(labelWithString: "")
     let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    let loginItem = NSMenuItem(title: "Açılışta başlat", action: #selector(toggleLogin), keyEquivalent: "")
-    let muteItem = NSMenuItem(title: "Mikrofonu sessize al", action: #selector(toggleMute), keyEquivalent: "m")
+    let loginItem = NSMenuItem(title: L("Açılışta başlat", "Start at login"), action: #selector(toggleLogin), keyEquivalent: "")
+    let muteItem = NSMenuItem(title: L("Mikrofonu sessize al", "Mute microphone"), action: #selector(toggleMute), keyEquivalent: "m")
     var watched = Set<AudioDeviceID>()
     var lastSent = -1
     var retries = 0
@@ -102,7 +109,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(muteItem)
         menu.addItem(.separator())
 
-        let title = NSMenuItem(title: "Gürültü azaltma", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: L("Gürültü azaltma", "Noise reduction"), action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
 
@@ -111,8 +118,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         slider.isContinuous = true
         slider.target = self
         slider.action = #selector(sliderMoved)
-        let lo = NSTextField(labelWithString: "Kapalı")
-        let hi = NSTextField(labelWithString: "Güçlü")
+        let lo = NSTextField(labelWithString: L("Kapalı", "Off"))
+        let hi = NSTextField(labelWithString: L("Güçlü", "Strong"))
         for l in [lo, hi, valueLabel] { l.font = NSFont.systemFont(ofSize: 11); l.textColor = .secondaryLabelColor }
         lo.frame = NSRect(x: 18, y: 4, width: 60, height: 16)
         hi.frame = NSRect(x: 192, y: 4, width: 50, height: 16); hi.alignment = .right
@@ -126,7 +133,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         loginItem.target = self
         menu.addItem(loginItem)
-        menu.addItem(NSMenuItem(title: "Çık", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: L("Çık", "Quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         menu.delegate = self
         item.menu = menu
 
@@ -161,8 +168,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func updateIcon(muted: Bool) {
         item.button?.image = NSImage(systemSymbolName: muted ? "mic.slash.fill" : "mic.fill",
-                                     accessibilityDescription: muted ? "Mikrofon sessiz" : "Mikrofon açık")
-        item.button?.toolTip = muted ? "Dahili Mikrofon — sessiz" : "Dahili Mikrofon — gürültü azaltma"
+                                     accessibilityDescription: muted ? L("Mikrofon sessiz", "Microphone muted") : L("Mikrofon açık", "Microphone on"))
+        item.button?.toolTip = muted ? L("Dahili Mikrofon — sessiz", "Internal Microphone — muted")
+                                     : L("Dahili Mikrofon — gürültü azaltma", "Internal Microphone — noise reduction")
     }
 
     @objc func toggleMute() {
@@ -186,15 +194,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func updateLabel() {
         let p = slider.integerValue
-        valueLabel.stringValue = p == 0 ? "%0" : p == 100 ? "%100" : "%\(p) (−\(Int((Double(p) * 0.4).rounded())) dB)"
+        valueLabel.stringValue = p == 0 || p == 100 ? pct(p) : "\(pct(p)) (−\(Int((Double(p) * 0.4).rounded())) dB)"
     }
 
     func refreshStatus() {
         if let cur = readStrength() {
-            statusLine.title = "Sürücüde: %\(cur)"
+            statusLine.title = L("Sürücüde: ", "Driver: ") + pct(cur)
             slider.isEnabled = true
         } else {
-            statusLine.title = "Cihaz bulunamadı (sürücü d10+ gerekli)"
+            statusLine.title = L("Cihaz bulunamadı (-voodoosof açık mı?)", "Device not found (is -voodoosof set?)")
             slider.isEnabled = false
         }
         loginItem.state = FileManager.default.fileExists(atPath: agentPath) ? .on : .off

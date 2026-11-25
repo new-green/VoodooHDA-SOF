@@ -16,6 +16,15 @@
 
 #include "rnnoise/rnnoise_kern.h"
 
+/* device names; SOF_LANG=tr at build time gives the Turkish ones */
+#if SOF_LANG_TR
+#define SOF_NAME_MIC		"Dahili Mikrofon"
+#define SOF_NAME_MIC_NR		"Dahili Mikrofon (G\xc3\xbcr\xc3\xbclt\xc3\xbc Azaltma)"
+#else
+#define SOF_NAME_MIC		"Internal Microphone"
+#define SOF_NAME_MIC_NR		"Internal Microphone (Noise Reduction)"
+#endif
+
 #define ENGLOG(fmt, ...)	IOLog("VoodooHDA SOF engine: " fmt "\n", ##__VA_ARGS__)
 
 #define super IOAudioEngine
@@ -113,7 +122,7 @@ bool VoodooHDASofEngine::initHardware(IOService *provider)
 	if (!super::initHardware(provider))
 		return false;
 
-	setDescription(mNrMode == kSofNrOff ? "Dahili Mikrofon" : "Dahili Mikrofon (Gürültü Azaltma)");
+	setDescription(mNrMode == kSofNrOff ? SOF_NAME_MIC : SOF_NAME_MIC_NR);
 	setSampleRate(&rate);
 	setNumSampleFramesPerBuffer(SOF_DMIC_BUF_SIZE / SOF_DMIC_FRAME_BYTES);
 	setInputSampleOffset(SOF_ENGINE_INPUT_OFFSET);
