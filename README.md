@@ -1,5 +1,7 @@
 # VoodooHDA + Intel SOF DMIC (experimental)
 
+**English** | [Türkçe](README.tr.md)
+
 This fork of [VoodooHDA](https://github.com/CloverHackyColor/VoodooHDA) makes the **built-in digital microphone (DMIC) of recent Intel laptops** work on macOS (Hackintosh).
 
 On Alder Lake and other recent Intel laptops, the internal microphones are not on the HDA codec. They sit behind the audio DSP (Intel cAVS / Sound Open Firmware). AppleALC and stock VoodooHDA cannot see them, so the internal mic simply does not exist on macOS. This fork boots Intel's SOF firmware on the DSP from inside VoodooHDA, sets up the DMIC pipeline the same way Linux does, and publishes the microphone as a normal CoreAudio input device.
@@ -88,14 +90,3 @@ The register layout and sequences are ported from the Linux SOF driver (`sound/s
 
 There is NO WARRANTY, as the licences above say. Intel, HP and Apple are trademarks of their owners. This project is not affiliated with any of them.
 
----
-
-## Türkçe özet
-
-Bu fork, yeni Intel laptopların **dahili dijital mikrofonunu (DMIC)** macOS'ta (Hackintosh) çalıştırır. Mikrofon ses kodeğine değil DSP'ye bağlı olduğu için AppleALC ve normal VoodooHDA onu göremez. Bu sürüm DSP'de Intel'in SOF firmware'ini başlatır ve mikrofonu normal bir giriş cihazı olarak gösterir.
-
-- **Deneysel:** Yalnızca **HP ProBook 440 G9 (Alder Lake, 8086:51C8), macOS Tahoe 26.7** üzerinde test edildi. Uyku/uyanma test edilmedi.
-- **Cihazlar:** iki giriş cihazı var: ham mikrofon ve gürültü azaltmalı (RNNoise) mikrofon. Menü çubuğu uygulaması SofMicBar ile gürültü azaltma gücü ayarlanır ve mikrofon sessize alınır. Mikrofon kullanılmadığında DSP uyur (D0i3).
-- **Derleme:** `./build-kext.sh`, Türkçe cihaz adları için `SOF_LANG=tr ./build-kext.sh`.
-- **Kurulum:** kext'i OpenCore'a koyup `boot-args`'a `-voodoosof` ekleyin. Geri almak için bu parametreyi silmek yeterlidir.
-- **Başka laptoplar:** [sof/README.md](sof/README.md) dosyasına bakın.

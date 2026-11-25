@@ -1,5 +1,7 @@
 # SOF data embedded in the kext
 
+**English** | [Türkçe](README.tr.md)
+
 `build-kext.sh` embeds two files from this directory into `VoodooHDA.kext`. It checks both against `SHA256SUMS` first.
 
 | File | What it is | Source / licence |
