@@ -11,6 +11,8 @@
 #include <IOKit/audio/IOAudioStream.h>
 #include <IOKit/audio/IOAudioTypes.h>
 #include <IOKit/audio/IOAudioDefines.h>
+#include <IOKit/audio/IOAudioLevelControl.h>
+#include <IOKit/audio/IOAudioToggleControl.h>
 
 #define ENGLOG(fmt, ...)	IOLog("VoodooHDA SOF engine: " fmt "\n", ##__VA_ARGS__)
 
@@ -82,6 +84,9 @@ bool VoodooHDASofEngine::initHardware(IOService *provider)
 	stream->setTerminalType(INPUT_MICROPHONE);
 	stream->release();
 
+	if (!createControls())
+		ENGLOG("warning: no input level controls");
+
 	mPosTimer = IOTimerEventSource::timerEventSource(this, &VoodooHDASofEngine::posTimerFired);
 	if (!mPosTimer || !getWorkLoop() || getWorkLoop()->addEventSource(mPosTimer) != kIOReturnSuccess) {
 		ENGLOG("error: no position timer");
@@ -89,6 +94,50 @@ bool VoodooHDASofEngine::initHardware(IOService *provider)
 	}
 	ENGLOG("ready: 48 kHz, 2 ch, S16LE, %u frames", (unsigned)(SOF_DMIC_BUF_SIZE / SOF_DMIC_FRAME_BYTES));
 	return true;
+}
+
+/* "Input level" slider (-50..+20 dB, 1 dB steps, bottom = mute) and input mute, both channels together */
+bool VoodooHDASofEngine::createControls()
+{
+	IOAudioControl *vol, *mute;
+
+	vol = IOAudioLevelControl::createVolumeControl(SOF_VOL_DEFAULT, 0, SOF_VOL_STEPS,
+			(IOFixed)(SOF_VOL_MIN_DB * 65536), (IOFixed)(SOF_VOL_MAX_DB * 65536),
+			kIOAudioControlChannelIDAll, kIOAudioControlChannelNameAll, 0, kIOAudioControlUsageInput);
+	if (!vol)
+		return false;
+	vol->setValueChangeHandler(&VoodooHDASofEngine::volumeChanged, this);
+	addDefaultAudioControl(vol);
+	vol->release();
+
+	mute = IOAudioToggleControl::createMuteControl(false, kIOAudioControlChannelIDAll,
+			kIOAudioControlChannelNameAll, 0, kIOAudioControlUsageInput);
+	if (!mute)
+		return false;
+	mute->setValueChangeHandler(&VoodooHDASofEngine::muteChanged, this);
+	addDefaultAudioControl(mute);
+	mute->release();
+	return true;
+}
+
+IOReturn VoodooHDASofEngine::volumeChanged(OSObject *target, IOAudioControl *, SInt32 oldValue, SInt32 newValue)
+{
+	VoodooHDASofEngine *self = OSDynamicCast(VoodooHDASofEngine, target);
+
+	if (!self || newValue < 0)
+		return kIOReturnBadArgument;
+	ENGLOG("input level %d -> %d (%d dB)", (int)oldValue, (int)newValue, (int)newValue + SOF_VOL_MIN_DB);
+	return self->mSof->setCaptureVolume((UInt32)newValue) ? kIOReturnSuccess : kIOReturnError;
+}
+
+IOReturn VoodooHDASofEngine::muteChanged(OSObject *target, IOAudioControl *, SInt32 oldValue, SInt32 newValue)
+{
+	VoodooHDASofEngine *self = OSDynamicCast(VoodooHDASofEngine, target);
+
+	if (!self)
+		return kIOReturnBadArgument;
+	ENGLOG("input mute %s", newValue ? "on" : "off");
+	return self->mSof->setCaptureMute(newValue != 0) ? kIOReturnSuccess : kIOReturnError;
 }
 
 void VoodooHDASofEngine::stop(IOService *provider)

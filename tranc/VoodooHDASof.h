@@ -159,6 +159,19 @@ struct _DmaMemory;
 #define SOF_PCMP_SIZE			32
 #define SOF_PCMP_STREAM_TAG		64
 
+/*
+ * Capture gain: volume component 0x33 of the DMIC pipeline. Topology "Capture Volume":
+ * 0..70 steps, -50 dB + 1 dB/step, step 0 = mute; "Capture Switch" 0/1.
+ * Sent as sof_ipc_ctrl_data (SET_VALUE) built from replay #10 (volume) and #9 (switch).
+ */
+#define SOF_VOL_STEPS			70
+#define SOF_VOL_MIN_DB			(-50)
+#define SOF_VOL_MAX_DB			20
+#define SOF_VOL_DEFAULT			SOF_VOL_STEPS	/* what the reference trace sets (#10) */
+#define SOF_REPLAY_SWITCH		9
+#define SOF_REPLAY_VOLUME		10
+#define SOF_CTRL_CHAN_VALUE(ch)		(88 + 8 * (ch))	/* payload offset of chanv[ch].value */
+
 /* timeouts (hda.h) */
 #define SOF_RESET_TIMEOUT_US		50000
 #define SOF_PD_TIMEOUT_US		50000
@@ -220,6 +233,8 @@ public:
 	void captureStop();
 	UInt32 captureFrame();
 	void *captureBuffer();
+	bool setCaptureVolume(UInt32 level);	/* 0..SOF_VOL_STEPS */
+	bool setCaptureMute(bool mute);
 
 private:
 	VoodooHDADevice *mDev;		/* owner, not retained */
@@ -261,6 +276,8 @@ private:
 	bool mNsnpFallback;
 	UInt32 mLdp0;			/* host DMA linear position at capture start */
 	IOLock *mLock;			/* IPC + capture state (engine runs on the audio workloop) */
+	UInt32 mVolLevel;		/* last capture volume step sent */
+	bool mMuted;
 
 	bool initWithDevice(VoodooHDADevice *device);
 	bool mapDsp();
@@ -326,6 +343,7 @@ private:
 	bool replay(int from, int to);
 	bool replayOne(int idx, const UInt8 *payloadOverride = NULL);
 	void teardownTopology();
+	bool sendCtrl(int replayIdx, UInt32 value, const char *what);
 
 	/* M3: DMIC capture (hda-pcm.c, hda-stream.c, ipc3-pcm.c, sof-utils.c) */
 	bool dmicAlloc();

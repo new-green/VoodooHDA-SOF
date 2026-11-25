@@ -120,6 +120,7 @@ bool VoodooHDASof::initWithDevice(VoodooHDADevice *device)
 	if (PE_parse_boot_argn("voodoosofstep", &val, sizeof val) && val >= 1 && val <= kSofStepMax)
 		mStep = val;
 	mLoader.index = mIccmax.index = mDmic.index = -1;
+	mVolLevel = SOF_VOL_DEFAULT;
 	mLock = IOLockAlloc();
 	if (!mLock)
 		return false;
@@ -1345,6 +1346,42 @@ void VoodooHDASof::teardownTopology()
 	mTopology = false;
 }
 
+/*
+ * Q8.16 linear gain per "Capture Volume" step: round(65536 * 10^((step - 50) / 20)), step 0 = mute
+ * (Linux set_up_volume_table() with the topology TLV: min -50 dB, step 1 dB, mute).
+ */
+static const UInt32 kSofVolGain[SOF_VOL_STEPS + 1] = {
+	0x0, 0xe9, 0x105, 0x125, 0x148, 0x171, 0x19e, 0x1d0, 0x209, 0x248, 0x28f, 0x2df, 0x339, 0x39e,
+	0x40f, 0x48d, 0x51c, 0x5bb, 0x66e, 0x737, 0x818, 0x915, 0xa31, 0xb6f, 0xcd5, 0xe65, 0x1027, 0x1220,
+	0x1456, 0x16d1, 0x199a, 0x1cb9, 0x203a, 0x2429, 0x2893, 0x2d86, 0x3314, 0x3950, 0x404e, 0x4827,
+	0x50f4, 0x5ad5, 0x65ea, 0x725a, 0x804e, 0x8ff6, 0xa186, 0xb53c, 0xcb59, 0xe429, 0x10000, 0x11f3d,
+	0x14249, 0x1699c, 0x195bc, 0x1c73d, 0x1feca, 0x23d1d, 0x2830b, 0x2d182, 0x3298b, 0x38c53, 0x3fb28,
+	0x47783, 0x5030a, 0x59f98, 0x64f40, 0x71457, 0x7f17b, 0x8e99a, 0xa0000
+};
+
+/* SET_VALUE on the volume component: replay message with both channel values replaced. Caller holds mLock. */
+bool VoodooHDASof::sendCtrl(int replayIdx, UInt32 value, const char *what)
+{
+	const SofReplayMsg *m = &gSofReplay[replayIdx];
+	UInt8 pl[SOF_IPC_MSG_MAX_SIZE];
+
+	if (!mDsp || !mFwReady || !mTopology)
+		return false;
+	if ((unsigned)replayIdx >= gSofReplayCount || m->size - 8 < SOF_CTRL_CHAN_VALUE(1) + 4 ||
+	    m->size - 8 > sizeof pl) {
+		SOFLOG("error: replay #%d is not a 2-channel SET_VALUE", replayIdx);
+		return false;
+	}
+	memcpy(pl, m->payload, m->size - 8);
+	memcpy(pl + SOF_CTRL_CHAN_VALUE(0), &value, 4);
+	memcpy(pl + SOF_CTRL_CHAN_VALUE(1), &value, 4);
+	bool ok = ipcTx(m->cmd, pl, m->size, NULL, 0);
+	SOFDBG("%s %08x: %s", what, (unsigned)value, ok ? "ok" : "FAILED");
+	if (!ok)
+		SOFLOG("error: %s %08x failed", what, (unsigned)value);
+	return ok;
+}
+
 /* ============================================================================ */
 /* M3/M4: DMIC capture                                                          */
 /* ============================================================================ */
@@ -1510,6 +1547,11 @@ bool VoodooHDASof::dmicStart()
 		return false;
 	}
 	mPcmParams = true;
+	/* keep the user's gain across stream setups (the topology default is what #9/#10 set) */
+	if (mVolLevel != SOF_VOL_DEFAULT)
+		sendCtrl(SOF_REPLAY_VOLUME, kSofVolGain[mVolLevel], "capture volume");
+	if (mMuted)
+		sendCtrl(SOF_REPLAY_SWITCH, 0, "capture switch");
 
 	/* trigger START: host DMA first, then IPC (sof_pcm_trigger, ipc_first=false) */
 	mLdp0 = hda32(mPpCap + 0x10 + 0x10 * (UInt32)s->index + 0x8);
@@ -1577,6 +1619,28 @@ UInt32 VoodooHDASof::captureFrame()
 void *VoodooHDASof::captureBuffer()
 {
 	return mDmic.buf ? (void *)mDmic.buf->virtAddr : NULL;
+}
+
+bool VoodooHDASof::setCaptureVolume(UInt32 level)
+{
+	if (level > SOF_VOL_STEPS)
+		level = SOF_VOL_STEPS;
+	IOLockLock(mLock);
+	bool ok = sendCtrl(SOF_REPLAY_VOLUME, kSofVolGain[level], "capture volume");
+	if (ok)
+		mVolLevel = level;
+	IOLockUnlock(mLock);
+	return ok;
+}
+
+bool VoodooHDASof::setCaptureMute(bool mute)
+{
+	IOLockLock(mLock);
+	bool ok = sendCtrl(SOF_REPLAY_SWITCH, mute ? 0 : 1, "capture switch");
+	if (ok)
+		mMuted = mute;
+	IOLockUnlock(mLock);
+	return ok;
 }
 
 /* integer 20*log10(x/32768) in tenths of dB (x > 0), ~0.3 dB accurate */

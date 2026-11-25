@@ -14,6 +14,7 @@
 
 class VoodooHDASof;
 class IOAudioStream;
+class IOAudioControl;
 
 #define SOF_ENGINE_POLL_MS		5
 #define SOF_ENGINE_INPUT_OFFSET		512	/* frames the HAL stays behind the DMA write position */
@@ -44,6 +45,9 @@ private:
 	UInt32 mWraps;
 
 	void pollPosition();
+	bool createControls();
+	static IOReturn volumeChanged(OSObject *target, IOAudioControl *control, SInt32 oldValue, SInt32 newValue);
+	static IOReturn muteChanged(OSObject *target, IOAudioControl *control, SInt32 oldValue, SInt32 newValue);
 	static void posTimerFired(OSObject *owner, IOTimerEventSource *sender);
 };
 
