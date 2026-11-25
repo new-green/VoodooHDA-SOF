@@ -13,7 +13,6 @@
 #include <IOKit/audio/IOAudioDefines.h>
 #include <IOKit/audio/IOAudioLevelControl.h>
 #include <IOKit/audio/IOAudioToggleControl.h>
-#include <IOKit/audio/IOAudioSelectorControl.h>
 
 #include "rnnoise/rnnoise_kern.h"
 
@@ -22,20 +21,23 @@
 #define super IOAudioEngine
 OSDefineMetaClassAndStructors(VoodooHDASofEngine, IOAudioEngine)
 
-bool VoodooHDASofEngine::initWithSof(VoodooHDASof *sof)
+bool VoodooHDASofEngine::initWithSof(VoodooHDASof *sof, UInt32 nrMode)
 {
-	if (!super::init(NULL) || !sof || !sof->captureBuffer())
+	if (!super::init(NULL) || !sof || !sof->captureBuffer() || nrMode > kSofNrStrong)
 		return false;
 	mSof = sof;
 	mSof->retain();
-	mNrMode = kSofNrOff;
+	mNrMode = nrMode;
+	if (mNrMode == kSofNrOff)
+		return true;
+	/* RNNoise is a single static instance: only one noise-reduced engine may exist */
 	mNrLock = IOLockAlloc();
 	mNrIn = (float *)IOMalloc(RNNK_FRAME * sizeof(float));
 	mNrBlk = (float *)IOMalloc(RNNK_FRAME * sizeof(float));
 	mNrOut = (float *)IOMalloc(SOF_RING_FRAMES * sizeof(float));
 	if (!mNrLock || !mNrIn || !mNrBlk || !mNrOut)
 		return false;
-	if (rnnk_init(SOF_NR_LIGHT_FLOOR) != 0) {
+	if (rnnk_init(mNrMode == kSofNrLight ? SOF_NR_LIGHT_FLOOR : 0.0f) != 0) {
 		ENGLOG("error: RNNoise init failed");
 		return false;
 	}
@@ -88,7 +90,7 @@ bool VoodooHDASofEngine::initHardware(IOService *provider)
 	if (!super::initHardware(provider))
 		return false;
 
-	setDescription("Dahili Mikrofon");
+	setDescription(mNrMode == kSofNrOff ? "Dahili Mikrofon" : "Dahili Mikrofon (Gürültü Azaltma)");
 	setSampleRate(&rate);
 	setNumSampleFramesPerBuffer(SOF_DMIC_BUF_SIZE / SOF_DMIC_FRAME_BYTES);
 	setInputSampleOffset(SOF_ENGINE_INPUT_OFFSET);
@@ -117,7 +119,8 @@ bool VoodooHDASofEngine::initHardware(IOService *provider)
 		ENGLOG("error: no position timer");
 		return false;
 	}
-	ENGLOG("ready: 48 kHz, 2 ch, S16LE, %u frames", (unsigned)(SOF_DMIC_BUF_SIZE / SOF_DMIC_FRAME_BYTES));
+	ENGLOG("ready: 48 kHz, 2 ch, S16LE, %u frames%s", (unsigned)(SOF_DMIC_BUF_SIZE / SOF_DMIC_FRAME_BYTES),
+	       mNrMode == kSofNrOff ? "" : mNrMode == kSofNrLight ? ", noise reduction light" : ", noise reduction strong");
 	return true;
 }
 
@@ -133,6 +136,7 @@ bool VoodooHDASofEngine::createControls()
 		return false;
 	vol->setValueChangeHandler(&VoodooHDASofEngine::volumeChanged, this);
 	addDefaultAudioControl(vol);
+	mVolCtl = vol;
 	vol->release();
 
 	mute = IOAudioToggleControl::createMuteControl(false, kIOAudioControlChannelIDAll,
@@ -141,37 +145,20 @@ bool VoodooHDASofEngine::createControls()
 		return false;
 	mute->setValueChangeHandler(&VoodooHDASofEngine::muteChanged, this);
 	addDefaultAudioControl(mute);
+	mMuteCtl = mute;
 	mute->release();
-
-	/* input source = noise reduction mode; shown as separate inputs in Sound settings */
-	IOAudioSelectorControl *src = IOAudioSelectorControl::createInputSelector(kSofNrOff,
-			kIOAudioControlChannelIDAll, kIOAudioControlChannelNameAll, 0);
-	if (!src)
-		return false;
-	src->addAvailableSelection(kSofNrOff, "Dahili Mikrofon");
-	src->addAvailableSelection(kSofNrLight, "Dahili Mikrofon (Gürültü Azaltma - hafif)");
-	src->addAvailableSelection(kSofNrStrong, "Dahili Mikrofon (Gürültü Azaltma - güçlü)");
-	src->setValueChangeHandler(&VoodooHDASofEngine::sourceChanged, this);
-	addDefaultAudioControl(src);
-	src->release();
 	return true;
 }
 
-IOReturn VoodooHDASofEngine::sourceChanged(OSObject *target, IOAudioControl *, SInt32 oldValue, SInt32 newValue)
+/* mirror a DSP-wide setting into the other engine's control (no handler call) */
+static void syncPeerControl(IOAudioControl *ctl, SInt32 value)
 {
-	VoodooHDASofEngine *self = OSDynamicCast(VoodooHDASofEngine, target);
+	OSNumber *n;
 
-	if (!self || (newValue != kSofNrOff && newValue != kSofNrLight && newValue != kSofNrStrong))
-		return kIOReturnBadArgument;
-	IOLockLock(self->mNrLock);
-	if (newValue != kSofNrOff)
-		rnnk_set_floor(newValue == kSofNrLight ? SOF_NR_LIGHT_FLOOR : 0.0f);
-	if (self->mNrMode == kSofNrOff)
-		self->mNrSync = false;		/* start clean when switching on */
-	self->mNrMode = newValue;
-	IOLockUnlock(self->mNrLock);
-	ENGLOG("noise reduction: %s", newValue == kSofNrOff ? "off" : newValue == kSofNrLight ? "light" : "strong");
-	return kIOReturnSuccess;
+	if (!ctl || !(n = OSNumber::withNumber((unsigned long long)(UInt32)value, 32)))
+		return;
+	ctl->hardwareValueChanged(n);
+	n->release();
 }
 
 IOReturn VoodooHDASofEngine::volumeChanged(OSObject *target, IOAudioControl *, SInt32 oldValue, SInt32 newValue)
@@ -181,7 +168,11 @@ IOReturn VoodooHDASofEngine::volumeChanged(OSObject *target, IOAudioControl *, S
 	if (!self || newValue < 0)
 		return kIOReturnBadArgument;
 	ENGLOG("input level %d -> %d (%d dB)", (int)oldValue, (int)newValue, (int)newValue + SOF_VOL_MIN_DB);
-	return self->mSof->setCaptureVolume((UInt32)newValue) ? kIOReturnSuccess : kIOReturnError;
+	if (!self->mSof->setCaptureVolume((UInt32)newValue))
+		return kIOReturnError;
+	if (self->mPeer)
+		syncPeerControl(self->mPeer->mVolCtl, newValue);
+	return kIOReturnSuccess;
 }
 
 IOReturn VoodooHDASofEngine::muteChanged(OSObject *target, IOAudioControl *, SInt32 oldValue, SInt32 newValue)
@@ -191,11 +182,19 @@ IOReturn VoodooHDASofEngine::muteChanged(OSObject *target, IOAudioControl *, SIn
 	if (!self)
 		return kIOReturnBadArgument;
 	ENGLOG("input mute %s", newValue ? "on" : "off");
-	return self->mSof->setCaptureMute(newValue != 0) ? kIOReturnSuccess : kIOReturnError;
+	if (!self->mSof->setCaptureMute(newValue != 0))
+		return kIOReturnError;
+	if (self->mPeer)
+		syncPeerControl(self->mPeer->mMuteCtl, newValue);
+	return kIOReturnSuccess;
 }
 
 void VoodooHDASofEngine::stop(IOService *provider)
 {
+	if (mPeer) {
+		mPeer->mPeer = NULL;
+		mPeer = NULL;
+	}
 	if (mPosTimer) {
 		mPosTimer->cancelTimeout();
 		if (getWorkLoop())
@@ -214,18 +213,29 @@ IOReturn VoodooHDASofEngine::performAudioEngineStart()
 		ENGLOG("error: capture start failed");
 		return kIOReturnError;
 	}
-	mRunning = true;
-	mLastFrame = 0;
 	mWraps = 0;
-	IOLockLock(mNrLock);
-	mNrSync = false;
-	mNrBlocks = 0;
-	mLimHits = 0;
-	IOLockUnlock(mNrLock);
-	takeTimeStamp(false);
+	if (mNrLock) {
+		IOLockLock(mNrLock);
+		mNrSync = false;
+		mNrBlocks = 0;
+		mLimHits = 0;
+		IOLockUnlock(mNrLock);
+	}
+	/*
+	 * The other engine may already be running the shared stream, so the ring is not
+	 * necessarily at frame 0: back-date the start time stamp to the ring's frame 0.
+	 */
+	uint64_t now, back, ts;
+	UInt32 frame = mSof->captureFrame();
+	clock_get_uptime(&now);
+	nanoseconds_to_absolutetime((uint64_t)frame * 1000000000ULL / SOF_DMIC_RATE, &back);
+	ts = now - back;
+	mLastFrame = frame;
+	mRunning = true;
+	takeTimeStamp(false, reinterpret_cast<AbsoluteTime *>(&ts));
 	if (mPosTimer)
 		mPosTimer->setTimeoutMS(SOF_ENGINE_POLL_MS);
-	ENGLOG("started");
+	ENGLOG("started at ring frame %u", (unsigned)frame);
 	return kIOReturnSuccess;
 }
 
@@ -320,7 +330,7 @@ IOReturn VoodooHDASofEngine::convertInputSamples(const void *sampleBuf, void *de
 	UInt32 n = numSampleFrames * SOF_DMIC_CHANNELS;
 	const float scale = 1.0f / 32768.0f;
 
-	if (mNrMode == kSofNrOff || firstSampleFrame >= SOF_RING_FRAMES || numSampleFrames > SOF_RING_FRAMES / 2) {
+	if (mNrMode == kSofNrOff || !mNrLock || firstSampleFrame >= SOF_RING_FRAMES || numSampleFrames > SOF_RING_FRAMES / 2) {
 		for (UInt32 i = 0; i < n; i++)
 			dst[i] = (float)src[i] * scale;
 		return kIOReturnSuccess;

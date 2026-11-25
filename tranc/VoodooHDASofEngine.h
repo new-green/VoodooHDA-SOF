@@ -19,13 +19,9 @@ class IOAudioControl;
 #define SOF_ENGINE_POLL_MS		5
 #define SOF_ENGINE_INPUT_OFFSET		512	/* frames the HAL stays behind the DMA write position */
 
-/* input source selector = noise reduction mode (RNNoise, mono) */
-enum {
-	kSofNrOff = 'imic',		/* "Dahili Mikrofon" */
-	kSofNrLight = 'inrl',		/* RNNoise, band gains floored at SOF_NR_LIGHT_FLOOR */
-	kSofNrStrong = 'inrs'		/* stock RNNoise */
-};
-#define SOF_NR_LIGHT_FLOOR		0.1f	/* -20 dB at most */
+/* noise reduction of the second engine (RNNoise, mono) */
+enum { kSofNrOff = 0, kSofNrLight = 1, kSofNrStrong = 2 };
+#define SOF_NR_LIGHT_FLOOR		0.1f	/* band gains floored at -20 dB */
 #define SOF_RING_FRAMES			(SOF_DMIC_BUF_SIZE / SOF_DMIC_FRAME_BYTES)
 #define SOF_NR_RESYNC_FRAMES		4096	/* a bigger jump in the read position restarts the denoiser */
 #define SOF_NR_LIMIT			29204.0f	/* -1 dBFS in 16-bit scale */
@@ -36,7 +32,9 @@ class VoodooHDASofEngine : public IOAudioEngine
 	OSDeclareDefaultStructors(VoodooHDASofEngine)
 
 public:
-	bool initWithSof(VoodooHDASof *sof);
+	bool initWithSof(VoodooHDASof *sof, UInt32 nrMode);
+	/* the other engine on the same DMIC stream: input level and mute are one DSP setting */
+	void setPeer(VoodooHDASofEngine *peer) { mPeer = peer; }
 	virtual void free() override;
 	virtual bool initHardware(IOService *provider) override;
 	virtual void stop(IOService *provider) override;
@@ -51,6 +49,9 @@ public:
 
 private:
 	VoodooHDASof *mSof;		/* retained */
+	VoodooHDASofEngine *mPeer;	/* not retained; cleared by stop() */
+	IOAudioControl *mVolCtl;	/* owned by the engine's control list */
+	IOAudioControl *mMuteCtl;
 	IOTimerEventSource *mPosTimer;
 	UInt32 mLastFrame;
 	bool mRunning;
@@ -58,7 +59,7 @@ private:
 
 	/* noise reduction (convertInputSamples, serialized by mNrLock) */
 	IOLock *mNrLock;
-	SInt32 mNrMode;
+	UInt32 mNrMode;
 	bool mNrSync;			/* false: restart at the next read */
 	UInt32 mNrInPos;		/* ring frame of the next input frame to feed */
 	UInt32 mNrBlockStart;		/* ring frame of mNrIn[0] */
@@ -75,7 +76,6 @@ private:
 	void pollPosition();
 	bool createControls();
 	void nrFeed(const SInt16 *ring, UInt32 endFrame);
-	static IOReturn sourceChanged(OSObject *target, IOAudioControl *control, SInt32 oldValue, SInt32 newValue);
 	static IOReturn volumeChanged(OSObject *target, IOAudioControl *control, SInt32 oldValue, SInt32 newValue);
 	static IOReturn muteChanged(OSObject *target, IOAudioControl *control, SInt32 oldValue, SInt32 newValue);
 	static void posTimerFired(OSObject *owner, IOTimerEventSource *sender);

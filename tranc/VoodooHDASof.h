@@ -235,6 +235,8 @@ public:
 	void *captureBuffer();
 	bool setCaptureVolume(UInt32 level);	/* 0..SOF_VOL_STEPS */
 	bool setCaptureMute(bool mute);
+	/* voodoosofnr=0|1|2: no / light (default) / strong noise-reduced second input device */
+	UInt32 nrMode() const { return mNrMode; }
 
 private:
 	VoodooHDADevice *mDev;		/* owner, not retained */
@@ -277,6 +279,8 @@ private:
 	UInt32 mLdp0;			/* host DMA linear position at capture start */
 	IOLock *mLock;			/* IPC + capture state (engine runs on the audio workloop) */
 	UInt32 mVolLevel;		/* last capture volume step sent */
+	UInt32 mCaptureUsers;		/* engines running on the shared DMIC stream */
+	UInt32 mNrMode;
 	bool mMuted;
 
 	bool initWithDevice(VoodooHDADevice *device);

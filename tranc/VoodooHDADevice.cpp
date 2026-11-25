@@ -866,13 +866,28 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 			mSof->release();
 			mSof = NULL;
 		}
-		/* M4: publish the DMIC capture engine ("Dahili Mikrofon") */
+		/* M4: publish the DMIC capture engine ("Dahili Mikrofon") and, unless voodoosofnr=0,
+		 * a noise-reduced second one on the same stream ("Dahili Mikrofon (Gürültü Azaltma)") */
 		if (mSof && mSof->captureReady()) {
 			VoodooHDASofEngine *sofEngine = new VoodooHDASofEngine;
-			if (sofEngine && sofEngine->initWithSof(mSof) && activateAudioEngine(sofEngine) == kIOReturnSuccess)
+			VoodooHDASofEngine *nrEngine = NULL;
+			if (sofEngine && sofEngine->initWithSof(mSof, 0) && activateAudioEngine(sofEngine) == kIOReturnSuccess) {
 				IOLog("VoodooHDA SOF: capture engine published\n");
-			else
+				if (mSof->nrMode()) {
+					nrEngine = new VoodooHDASofEngine;
+					if (nrEngine && nrEngine->initWithSof(mSof, mSof->nrMode()) &&
+					    activateAudioEngine(nrEngine) == kIOReturnSuccess) {
+						sofEngine->setPeer(nrEngine);
+						nrEngine->setPeer(sofEngine);
+						IOLog("VoodooHDA SOF: noise-reduced capture engine published\n");
+					} else {
+						errorMsg("VoodooHDA SOF: noise-reduced capture engine could not be published\n");
+					}
+				}
+			} else {
 				errorMsg("VoodooHDA SOF: capture engine could not be published\n");
+			}
+			RELEASE(nrEngine);
 			RELEASE(sofEngine);
 		}
 	}

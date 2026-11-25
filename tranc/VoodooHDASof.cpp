@@ -121,6 +121,9 @@ bool VoodooHDASof::initWithDevice(VoodooHDADevice *device)
 		mStep = val;
 	mLoader.index = mIccmax.index = mDmic.index = -1;
 	mVolLevel = SOF_VOL_DEFAULT;
+	mNrMode = 1;
+	if (PE_parse_boot_argn("voodoosofnr", &val, sizeof val) && val <= 2)
+		mNrMode = val;
 	mLock = IOLockAlloc();
 	if (!mLock)
 		return false;
@@ -1591,10 +1594,13 @@ bool VoodooHDASof::captureReady()
 	return mFwReady && mTopology && mDmic.buf;
 }
 
+/* both engines ("Dahili Mikrofon" and the noise-reduced one) share the one DMIC stream */
 bool VoodooHDASof::captureStart()
 {
 	IOLockLock(mLock);
-	bool ok = mDsp && dmicStart();
+	bool ok = mDsp && (mCaptureUsers > 0 || dmicStart());
+	if (ok)
+		mCaptureUsers++;
 	IOLockUnlock(mLock);
 	return ok;
 }
@@ -1602,7 +1608,7 @@ bool VoodooHDASof::captureStart()
 void VoodooHDASof::captureStop()
 {
 	IOLockLock(mLock);
-	if (mDsp && mFwReady)
+	if (mCaptureUsers > 0 && --mCaptureUsers == 0 && mDsp && mFwReady)
 		dmicStop();
 	IOLockUnlock(mLock);
 }
