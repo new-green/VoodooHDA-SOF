@@ -1,8 +1,11 @@
 // SofMicBar — menu bar slider for the noise reduction strength of "Dahili Mikrofon (Gürültü Azaltma)".
 // Part of the VoodooHDA SOF port. Talks to the VoodooHDASofEngine through its "SofNrStrength"
 // registry property (0..100 %, 50 = -20 dB band gain floor, 100 = no floor).
+// Mute: the CoreAudio input mute of the SOF devices (the kext sends it to the DSP and keeps both
+// "Dahili Mikrofon" devices in sync); macOS Sound settings has no input mute button.
 import AppKit
 import IOKit
+import CoreAudio
 
 let kKey = "SofNrStrength"
 let kDefaultsKey = "nrStrength"
@@ -27,6 +30,46 @@ func readStrength() -> Int? {
     return (IORegistryEntryCreateCFProperty(s, kKey as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber)?.intValue
 }
 
+// CoreAudio devices published by VoodooHDASofEngine (raw + noise-reduced)
+func sofDevices() -> [AudioDeviceID] {
+    var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+                                       mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &size) == noErr else { return [] }
+    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &size, &ids) == noErr else { return [] }
+    return ids.filter { id in
+        var ua = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID,
+                                            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var uid: Unmanaged<CFString>?
+        var us = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(id, &ua, 0, nil, &us, &uid) == noErr, let u = uid?.takeRetainedValue() else { return false }
+        return (u as String).hasPrefix("VoodooHDASofEngine")
+    }
+}
+
+var muteAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute,
+                                             mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+
+func readMute() -> Bool? {
+    for d in sofDevices() {
+        var v: UInt32 = 0
+        var sz = UInt32(MemoryLayout<UInt32>.size)
+        if AudioObjectGetPropertyData(d, &muteAddress, 0, nil, &sz, &v) == noErr { return v != 0 }
+    }
+    return nil
+}
+
+@discardableResult
+func writeMute(_ on: Bool) -> Bool {
+    var ok = false
+    for d in sofDevices() {
+        var v: UInt32 = on ? 1 : 0
+        if AudioObjectSetPropertyData(d, &muteAddress, 0, nil, UInt32(MemoryLayout<UInt32>.size), &v) == noErr { ok = true }
+    }
+    return ok
+}
+
 @discardableResult
 func writeStrength(_ pct: Int) -> Bool {
     guard let s = findNrEngine() else { return false }
@@ -42,6 +85,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let valueLabel = NSTextField(labelWithString: "")
     let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let loginItem = NSMenuItem(title: "Açılışta başlat", action: #selector(toggleLogin), keyEquivalent: "")
+    let muteItem = NSMenuItem(title: "Mikrofonu sessize al", action: #selector(toggleMute), keyEquivalent: "m")
+    var watched = Set<AudioDeviceID>()
     var lastSent = -1
     var retries = 0
 
@@ -51,8 +96,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        item.button?.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Gürültü azaltma")
-        item.button?.toolTip = "Dahili Mikrofon — gürültü azaltma"
+        updateIcon(muted: false)
+
+        muteItem.target = self
+        menu.addItem(muteItem)
+        menu.addItem(.separator())
 
         let title = NSMenuItem(title: "Gürültü azaltma", action: nil, keyEquivalent: "")
         title.isEnabled = false
@@ -85,6 +133,41 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         slider.integerValue = saved
         updateLabel()
         pushSaved()
+        watchMute()
+        // the device list changes when the kext (re)loads: watch the new devices too
+        var da = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+                                            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &da, DispatchQueue.main) { [weak self] _, _ in
+            self?.watchMute()
+        }
+    }
+
+    // icon + check mark follow the mute state, also when another app changes it
+    func watchMute() {
+        for d in sofDevices() where !watched.contains(d) {
+            if AudioObjectAddPropertyListenerBlock(d, &muteAddress, DispatchQueue.main, { [weak self] _, _ in
+                self?.refreshMute()
+            }) == noErr { watched.insert(d) }
+        }
+        refreshMute()
+    }
+
+    func refreshMute() {
+        let m = readMute()
+        muteItem.isEnabled = m != nil
+        muteItem.state = m == true ? .on : .off
+        updateIcon(muted: m == true)
+    }
+
+    func updateIcon(muted: Bool) {
+        item.button?.image = NSImage(systemSymbolName: muted ? "mic.slash.fill" : "mic.fill",
+                                     accessibilityDescription: muted ? "Mikrofon sessiz" : "Mikrofon açık")
+        item.button?.toolTip = muted ? "Dahili Mikrofon — sessiz" : "Dahili Mikrofon — gürültü azaltma"
+    }
+
+    @objc func toggleMute() {
+        if let m = readMute() { writeMute(!m) }
+        refreshMute()
     }
 
     // the kext starts at its own default after every boot: push the saved value (retry while it loads)
@@ -117,7 +200,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem.state = FileManager.default.fileExists(atPath: agentPath) ? .on : .off
     }
 
-    func menuWillOpen(_ m: NSMenu) { refreshStatus() }
+    func menuWillOpen(_ m: NSMenu) { refreshStatus(); refreshMute() }
 
     @objc func sliderMoved() {
         let p = slider.integerValue

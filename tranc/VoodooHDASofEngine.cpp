@@ -332,6 +332,7 @@ void VoodooHDASofEngine::nrReset()
 	mNrFill = 0;
 	mHpX1 = mHpX2 = mHpY1 = mHpY2 = 0;
 	mLimGain = 1.0f;
+	rnnk_reset();
 	mNrSync = true;
 }
 

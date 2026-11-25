@@ -15,6 +15,7 @@ extern "C" {
 int rnnk_init(float gain_floor);
 /* lowest band gain for the following frames */
 void rnnk_set_floor(float gain_floor);
+void rnnk_reset(void);
 /* denoise one frame (output is delayed by one frame); returns the voice probability */
 float rnnk_process(float *out, const float *in);
 

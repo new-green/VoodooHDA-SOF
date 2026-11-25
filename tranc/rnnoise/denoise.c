@@ -513,6 +513,12 @@ int rnnk_init(float gain_floor)
   return 0;
 }
 
+/* forget all audio history (stream restart): no stale audio leaks into the next capture */
+void rnnk_reset(void)
+{
+  rnnoise_init(&rnnk_state, NULL);
+}
+
 void rnnk_set_floor(float gain_floor)
 {
   rnnk_gain_floor = gain_floor;
