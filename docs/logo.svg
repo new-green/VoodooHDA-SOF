@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3E3B6E"/>
+      <stop offset="1" stop-color="#25233F"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <!-- mic handle (under the hand) -->
+  <line x1="350" y1="385" x2="303" y2="540" stroke="#9AA1AE" stroke-width="36" stroke-linecap="round"/>
+  <!-- doll: one burlap silhouette -->
+  <g fill="#D2AE72" stroke="#D2AE72" stroke-linecap="round">
+    <line x1="490" y1="690" x2="450" y2="815" stroke-width="86"/>
+    <line x1="590" y1="690" x2="630" y2="815" stroke-width="86"/>
+    <line x1="610" y1="560" x2="725" y2="630" stroke-width="80"/>
+    <line x1="470" y1="560" x2="328" y2="472" stroke-width="80"/>
+    <rect x="440" y="490" width="200" height="235" rx="92" stroke="none"/>
+    <circle cx="540" cy="400" r="135" stroke="none"/>
+  </g>
+  <!-- stitches -->
+  <g stroke="#5A3F28" stroke-linecap="round" fill="none">
+    <path d="M478 368 l34 34 M512 368 l-34 34" stroke-width="14"/>
+    <path d="M568 368 l34 34 M602 368 l-34 34" stroke-width="14"/>
+    <path d="M500 455 Q540 478 580 455" stroke-width="10" stroke-dasharray="14 12"/>
+  </g>
+  <line x1="540" y1="520" x2="540" y2="700" stroke="#B08E55" stroke-width="10" stroke-linecap="round" stroke-dasharray="18 16"/>
+  <!-- pin -->
+  <line x1="606" y1="332" x2="660" y2="278" stroke="#C9CDD4" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="668" cy="270" r="26" fill="#E5484D"/>
+  <!-- mic head -->
+  <circle cx="355" cy="362" r="56" fill="#D9DDE4"/>
+  <g stroke="#A9B0BC" stroke-width="6" fill="none" stroke-linecap="round">
+    <path d="M305 345 Q355 330 405 345"/>
+    <path d="M300 368 Q355 352 410 368"/>
+    <path d="M308 391 Q355 377 402 391"/>
+    <path d="M335 310 Q325 362 338 414"/>
+    <path d="M375 310 Q385 362 372 414"/>
+  </g>
+  <circle cx="355" cy="362" r="56" fill="none" stroke="#C3C8D1" stroke-width="6"/>
+</svg>

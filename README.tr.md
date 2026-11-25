@@ -1,5 +1,7 @@
 # VoodooHDA + Intel SOF DMIC (deneysel)
 
+<p align="center"><img src="docs/logo.svg" width="160" alt="VoodooHDA SOF logosu: elinde mikrofon tutan bir vudu bebeği"></p>
+
 [English](README.md) | **Türkçe**
 
 Bu [VoodooHDA](https://github.com/CloverHackyColor/VoodooHDA) fork'u, **yeni Intel laptopların dahili dijital mikrofonunu (DMIC)** macOS'ta (Hackintosh) çalıştırır.

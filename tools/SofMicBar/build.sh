@@ -7,5 +7,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 swiftc -O -target x86_64-apple-macos13.0 -framework AppKit -framework IOKit -o "$APP/Contents/MacOS/SofMicBar" main.swift
 cp Info.plist "$APP/Contents/Info.plist"
+mkdir -p "$APP/Contents/Resources"
+cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 codesign -s - --force "$APP"
 echo "OK: $(pwd)/$APP"

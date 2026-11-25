@@ -1,5 +1,7 @@
 # VoodooHDA + Intel SOF DMIC (experimental)
 
+<p align="center"><img src="docs/logo.svg" width="160" alt="VoodooHDA SOF logo: a voodoo doll holding a microphone"></p>
+
 **English** | [Türkçe](README.tr.md)
 
 This fork of [VoodooHDA](https://github.com/CloverHackyColor/VoodooHDA) makes the **built-in digital microphone (DMIC) of recent Intel laptops** work on macOS (Hackintosh).
