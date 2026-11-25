@@ -220,6 +220,7 @@ IOReturn VoodooHDASofEngine::performAudioEngineStart()
 	IOLockLock(mNrLock);
 	mNrSync = false;
 	mNrBlocks = 0;
+	mLimHits = 0;
 	IOLockUnlock(mNrLock);
 	takeTimeStamp(false);
 	if (mPosTimer)
@@ -236,7 +237,8 @@ IOReturn VoodooHDASofEngine::performAudioEngineStop()
 		mRunning = false;
 		mSof->captureStop();
 	}
-	ENGLOG("stopped after %u buffer wraps (%u denoised blocks)", (unsigned)mWraps, (unsigned)mNrBlocks);
+	ENGLOG("stopped after %u buffer wraps (%u denoised blocks, %u limiter hits)", (unsigned)mWraps,
+	       (unsigned)mNrBlocks, (unsigned)mLimHits);
 	return kIOReturnSuccess;
 }
 
@@ -262,21 +264,48 @@ IOReturn VoodooHDASofEngine::performFormatChange(IOAudioStream *, const IOAudioS
  * only depends on input that is older than itself, which the HAL never reads ahead of.
  * Latency: +20 ms. Caller holds mNrLock.
  */
+/* Caller holds mNrLock. RNNoise keeps its state; it adapts within a few frames. */
+void VoodooHDASofEngine::nrReset()
+{
+	bzero(mNrOut, SOF_RING_FRAMES * sizeof(float));
+	mNrFill = 0;
+	mHpX1 = mHpX2 = mHpY1 = mHpY2 = 0;
+	mLimGain = 1.0f;
+	mNrSync = true;
+}
+
 void VoodooHDASofEngine::nrFeed(const SInt16 *ring, UInt32 endFrame)
 {
+	/* 2nd-order Butterworth high-pass, fc 90 Hz, fs 48 kHz (RBJ cookbook) */
+	const double b0 = 0.991704195577, b1 = -1.983408391154, b2 = 0.991704195577;
+	const double a1 = -1.983339569599, a2 = 0.983477212710;
+
 	UInt32 todo = (endFrame + SOF_RING_FRAMES - mNrInPos) % SOF_RING_FRAMES;
 
 	while (todo--) {
 		const SInt16 *f = ring + mNrInPos * SOF_DMIC_CHANNELS;
 		if (mNrFill == 0)
 			mNrBlockStart = mNrInPos;
-		mNrIn[mNrFill++] = 0.5f * ((float)f[0] + (float)f[1]);	/* RNNoise works in 16-bit scale */
+		double x = 0.5 * ((double)f[0] + (double)f[1]);		/* RNNoise works in 16-bit scale */
+		double y = b0 * x + b1 * mHpX1 + b2 * mHpX2 - a1 * mHpY1 - a2 * mHpY2;
+		mHpX2 = mHpX1; mHpX1 = x;
+		mHpY2 = mHpY1; mHpY1 = y;
+		mNrIn[mNrFill++] = (float)y;
 		mNrInPos = (mNrInPos + 1) % SOF_RING_FRAMES;
 		if (mNrFill == RNNK_FRAME) {
 			rnnk_process(mNrBlk, mNrIn);
 			UInt32 o = (mNrBlockStart + RNNK_FRAME) % SOF_RING_FRAMES;
-			for (UInt32 i = 0; i < RNNK_FRAME; i++)
-				mNrOut[(o + i) % SOF_RING_FRAMES] = mNrBlk[i];
+			for (UInt32 i = 0; i < RNNK_FRAME; i++) {
+				/* peak limiter: instant attack, 100 ms release */
+				float v = mNrBlk[i], a = v < 0 ? -v : v;
+				if (a * mLimGain > SOF_NR_LIMIT) {
+					mLimGain = SOF_NR_LIMIT / a;
+					mLimHits++;
+				} else {
+					mLimGain += (1.0f - mLimGain) * SOF_NR_LIMIT_RELEASE;
+				}
+				mNrOut[(o + i) % SOF_RING_FRAMES] = v * mLimGain;
+			}
 			mNrFill = 0;
 			mNrBlocks++;
 		}
@@ -301,10 +330,8 @@ IOReturn VoodooHDASofEngine::convertInputSamples(const void *sampleBuf, void *de
 	UInt32 end = (firstSampleFrame + numSampleFrames) % SOF_RING_FRAMES;
 	if (!mNrSync || (end + SOF_RING_FRAMES - mNrInPos) % SOF_RING_FRAMES > SOF_NR_RESYNC_FRAMES) {
 		/* (re)start: output stays silent until the first block lands (<= 20 ms) */
-		bzero(mNrOut, SOF_RING_FRAMES * sizeof(float));
 		mNrInPos = firstSampleFrame;
-		mNrFill = 0;
-		mNrSync = true;
+		nrReset();
 	}
 	nrFeed((const SInt16 *)sampleBuf, end);
 	for (UInt32 i = 0; i < numSampleFrames; i++) {

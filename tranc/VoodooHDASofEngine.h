@@ -28,6 +28,8 @@ enum {
 #define SOF_NR_LIGHT_FLOOR		0.1f	/* -20 dB at most */
 #define SOF_RING_FRAMES			(SOF_DMIC_BUF_SIZE / SOF_DMIC_FRAME_BYTES)
 #define SOF_NR_RESYNC_FRAMES		4096	/* a bigger jump in the read position restarts the denoiser */
+#define SOF_NR_LIMIT			29204.0f	/* -1 dBFS in 16-bit scale */
+#define SOF_NR_LIMIT_RELEASE		0.000208312f	/* 100 ms at 48 kHz */
 
 class VoodooHDASofEngine : public IOAudioEngine
 {
@@ -65,6 +67,10 @@ private:
 	float *mNrBlk;			/* RNNK_FRAME output frames */
 	float *mNrOut;			/* SOF_RING_FRAMES mono output, ring positions */
 	UInt32 mNrBlocks;
+	double mHpX1, mHpX2, mHpY1, mHpY2;	/* 90 Hz high-pass before RNNoise */
+	float mLimGain;				/* peak limiter after RNNoise */
+	UInt32 mLimHits;
+	void nrReset();
 
 	void pollPosition();
 	bool createControls();
