@@ -159,8 +159,11 @@ sed -e "s/\${EXECUTABLE_NAME}/VoodooHDA/; s/\$(PRODUCT_BUNDLE_IDENTIFIER)/$BUNDL
 P="$KEXT/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string $MIN_OS" "$P"
 /usr/libexec/PlistBuddy -c "Add :CFBundleSupportedPlatforms array" -c "Add :CFBundleSupportedPlatforms:0 string MacOSX" "$P"
-BUILD_ID=$(cd "$ROOT" && git rev-parse --short HEAD 2>/dev/null || echo nogit)
-(cd "$ROOT" && git diff --quiet HEAD -- tranc 2>/dev/null) || BUILD_ID="$BUILD_ID-dirty"
+if BUILD_ID=$(cd "$ROOT" && git rev-parse --short HEAD 2>/dev/null); then
+  (cd "$ROOT" && git diff --quiet HEAD -- tranc sof) || BUILD_ID="$BUILD_ID-dirty"
+else
+  BUILD_ID=nogit
+fi
 /usr/libexec/PlistBuddy -c "Add :VoodooSofBuild string $BUILD_ID-$SOF_LANG" "$P"
 grep -q '\$(' "$P" && { echo "unsubstituted variable in Info.plist"; exit 1; }
 plutil -lint "$P" >/dev/null
