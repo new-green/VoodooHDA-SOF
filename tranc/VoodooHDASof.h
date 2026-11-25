@@ -64,7 +64,9 @@ struct _DmaMemory;
 #define SOF_SPB_SPIB(i)			((UInt32)(0x08 + 0x08 * (i)))
 #define SOF_VS_EM2			0x1030
 #define SOF_VS_EM2_L1SEN		(1U << 13)
-#define SOF_VS_D0I3C			0x104A
+#define SOF_VS_D0I3C			0x104A	/* 8 bit */
+#define SOF_VS_D0I3C_CIP		0x01	/* command in progress */
+#define SOF_VS_D0I3C_I3			0x04	/* D0i3 allowed */
 #define SOF_VS_LTRP			0x1048
 #define SOF_VS_LTRP_GB_MASK		0x3F
 #define SOF_LTRP_GB_VALUE_US		95
@@ -107,6 +109,12 @@ struct _DmaMemory;
 #define SOF_IPC_BUSY			(1U << 31)	/* HIPCIDR / HIPCTDR */
 #define SOF_IPC_DONE			(1U << 31)	/* HIPCIDA / HIPCTDA */
 #define SOF_IPC_MSG_MASK		0x7FFFFFFFU
+/* compact PM_GATE IPC (cnl_compact_ipc_compress): HIPCIDR type, flags in HIPCIDD (hda-ipc.h) */
+#define SOF_IPC_MSG_COMPACT		(1U << 30)
+#define SOF_IPC_PM_GATE_COMPACT		(0x8U << 24)
+#define SOF_PM_NO_DMA_TRACE		(1U << 4)
+#define SOF_PM_PPG			(1U << 2)	/* prevent power gating (D0i0) */
+#define SOF_IDLE_D0I3_MS		5000		/* DSP to D0i3 this long after the last capture user */
 #define SOF_DSP_MBOX_OFFSET		0x80000	/* SRAM window 0 */
 #define SOF_DSP_MBOX_UPLINK_OFFSET	0x81000
 #define SOF_SRAM_ROM_STATUS		(SOF_DSP_MBOX_OFFSET + 0x0)
@@ -274,6 +282,20 @@ private:
 	UInt32 mCaptureUsers;		/* engines running on the shared DMIC stream */
 	UInt32 mNrMode;
 	bool mMuted;
+
+	/* idle power: D0i3 while nobody captures (hda_dsp_set_D0_state) */
+	bool mPmEnabled;		/* boot-arg voodoosofpm=0 turns it off */
+	bool mD0i3;			/* DSP is in D0i3 */
+	bool mStopping;			/* no more idle timers */
+	UInt32 mD0i3Entries;
+	IOWorkLoop *mIdleLoop;		/* own workloop: the timer action takes mLock */
+	IOTimerEventSource *mIdleTimer;
+	bool waitD0i3cIdle();
+	bool pmGate(UInt32 flags);
+	bool setD0i3(bool enter);
+	bool ensureD0() { return !mD0i3 || setD0i3(false); }
+	void armIdle();
+	static void idleFired(OSObject *owner, IOTimerEventSource *sender);
 
 	bool initWithDevice(VoodooHDADevice *device);
 	bool mapDsp();

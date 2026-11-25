@@ -124,6 +124,9 @@ bool VoodooHDASof::initWithDevice(VoodooHDADevice *device)
 	mNrMode = 1;
 	if (PE_parse_boot_argn("voodoosofnr", &val, sizeof val) && val <= 2)
 		mNrMode = val;
+	mPmEnabled = true;
+	if (PE_parse_boot_argn("voodoosofpm", &val, sizeof val) && val == 0)
+		mPmEnabled = false;
 	mLock = IOLockAlloc();
 	if (!mLock)
 		return false;
@@ -1081,6 +1084,8 @@ void VoodooHDASof::powerDownDsp()
 {
 	if (!mDsp)
 		return;
+	if (mFwReady)
+		ensureD0();
 	if (mFwReady && mDspBoxSize) {
 		dmicStop();
 		teardownTopology();
@@ -1245,6 +1250,8 @@ bool VoodooHDASof::ipcTx(UInt32 cmd, const UInt8 *payload, UInt32 size, void *re
 		SOFLOG("error: ipc %08x bad size %u", (unsigned)cmd, (unsigned)size);
 		return false;
 	}
+	if (!ensureD0())
+		return false;
 	if (dsp32(SOF_CNL_HIPCIDR) & SOF_IPC_BUSY)	/* Linux does not check this; just note it */
 		SOFLOG("warning: ipc %08x: HIPCIDR still busy (%08x)", (unsigned)cmd, (unsigned)dsp32(SOF_CNL_HIPCIDR));
 	bzero(msg, sizeof msg);
@@ -1486,6 +1493,8 @@ bool VoodooHDASof::dmicStart()
 		return true;
 	if (!mFwReady || !mTopology || !dmicAlloc())
 		return false;
+	if (!ensureD0())
+		return false;
 	bzero((void *)s->buf->virtAddr, SOF_DMIC_BUF_SIZE);
 	if (!dmicHwParams()) {
 		dmicHwStop();
@@ -1552,6 +1561,101 @@ void VoodooHDASof::dmicStop()
 	}
 }
 
+/* ============================================================================ */
+/* M5: idle power — D0i3 while no engine captures (hda_dsp_set_D0_state, IPC3)  */
+/* ============================================================================ */
+
+/* hda_dsp_wait_d0i3c_done(): D0I3C.CIP clear (Linux: 50 tries x 10-15 us) */
+bool VoodooHDASof::waitD0i3cIdle()
+{
+	for (int i = 0; i < 100; i++) {
+		if (!(hda8(SOF_VS_D0I3C) & SOF_VS_D0I3C_CIP))
+			return true;
+		IODelay(10);
+	}
+	return false;
+}
+
+/* compact PM_GATE IPC (cnl_ipc_send_msg + cnl_compact_ipc_compress): flags in HIPCIDD, no mailbox */
+bool VoodooHDASof::pmGate(UInt32 flags)
+{
+	UInt32 v, waited = 0;
+
+	if (dsp32(SOF_CNL_HIPCIDR) & SOF_IPC_BUSY)
+		SOFLOG("warning: PM_GATE: HIPCIDR still busy (%08x)", (unsigned)dsp32(SOF_CNL_HIPCIDR));
+	dspW32(SOF_CNL_HIPCIDD, flags);
+	dspW32(SOF_CNL_HIPCIDR, SOF_IPC_BUSY | SOF_IPC_MSG_COMPACT | SOF_IPC_PM_GATE_COMPACT);
+	for (;;) {
+		v = dsp32(SOF_CNL_HIPCIDA);
+		if (v & SOF_IPC_DONE)
+			break;
+		serviceNotification();
+		if (waited >= SOF_IPC_TIMEOUT_US) {
+			SOFLOG("error: PM_GATE %02x timeout (IDR %08x IDA %08x)", (unsigned)flags,
+			       (unsigned)dsp32(SOF_CNL_HIPCIDR), (unsigned)v);
+			return false;
+		}
+		if (waited < 2000) { IODelay(20); waited += 20; } else { IOSleep(1); waited += 1000; }
+	}
+	dspUpdate32(SOF_CNL_HIPCIDA, SOF_IPC_DONE, SOF_IPC_DONE);	/* cnl_ipc_dsp_done */
+	SOFDBG("PM_GATE %02x done (IDA %08x, %u us)", (unsigned)flags, (unsigned)v, (unsigned)waited);
+	return true;
+}
+
+/*
+ * hda_dsp_set_D0_state(): D0I3C.I3 first, then PM_GATE (D0i3: power gating allowed, no DMA
+ * trace; D0i0: PPG). If the IPC fails the register goes back. Caller holds mLock.
+ */
+bool VoodooHDASof::setD0i3(bool enter)
+{
+	UInt8 want = enter ? SOF_VS_D0I3C_I3 : 0;
+
+	if (!mDsp || !mFwReady)
+		return false;
+	if (!waitD0i3cIdle()) {
+		SOFLOG("error: D0I3C CIP timeout before update (%02x)", (unsigned)hda8(SOF_VS_D0I3C));
+		return false;
+	}
+	hdaW8(SOF_VS_D0I3C, (UInt8)((hda8(SOF_VS_D0I3C) & ~SOF_VS_D0I3C_I3) | want));
+	IODelay(40);
+	if (!waitD0i3cIdle() || ((hda8(SOF_VS_D0I3C) ^ want) & SOF_VS_D0I3C_I3)) {
+		SOFLOG("error: D0I3C update to %02x failed (%02x)", (unsigned)want, (unsigned)hda8(SOF_VS_D0I3C));
+		return false;
+	}
+	if (!pmGate(enter ? SOF_PM_NO_DMA_TRACE : SOF_PM_PPG)) {
+		hdaW8(SOF_VS_D0I3C, (UInt8)((hda8(SOF_VS_D0I3C) & ~SOF_VS_D0I3C_I3) | (enter ? 0 : SOF_VS_D0I3C_I3)));
+		IODelay(40);
+		waitD0i3cIdle();
+		return false;
+	}
+	mD0i3 = enter;
+	if (enter)
+		mD0i3Entries++;
+	SOFLOG("DSP %s (D0I3C %02x)", enter ? "idle: D0i3" : "awake: D0i0", (unsigned)hda8(SOF_VS_D0I3C));
+	return true;
+}
+
+/* (re)start the idle countdown; idleFired checks again that nobody captures. Caller holds mLock. */
+void VoodooHDASof::armIdle()
+{
+	if (!mPmEnabled || !mIdleTimer || mStopping || mD0i3 || mCaptureUsers)
+		return;
+	mIdleTimer->setTimeoutMS(SOF_IDLE_D0I3_MS);	/* replaces a pending timeout */
+}
+
+void VoodooHDASof::idleFired(OSObject *owner, IOTimerEventSource *)
+{
+	VoodooHDASof *self = OSDynamicCast(VoodooHDASof, owner);
+
+	if (!self)
+		return;
+	IOLockLock(self->mLock);
+	if (!self->mStopping && !self->mD0i3 && !self->mCaptureUsers && !self->mCapturing &&
+	    self->mFwReady && self->mTopology && self->mDsp)
+		self->setD0i3(true);
+	IOLockUnlock(self->mLock);
+}
+
 /* ---- public capture API (VoodooHDASofEngine) ---- */
 
 bool VoodooHDASof::captureReady()
@@ -1573,8 +1677,10 @@ bool VoodooHDASof::captureStart()
 void VoodooHDASof::captureStop()
 {
 	IOLockLock(mLock);
-	if (mCaptureUsers > 0 && --mCaptureUsers == 0 && mDsp && mFwReady)
+	if (mCaptureUsers > 0 && --mCaptureUsers == 0 && mDsp && mFwReady) {
 		dmicStop();
+		armIdle();
+	}
 	IOLockUnlock(mLock);
 }
 
@@ -1600,6 +1706,7 @@ bool VoodooHDASof::setCaptureVolume(UInt32 level)
 	bool ok = sendCtrl(SOF_REPLAY_VOLUME, kSofVolGain[level], "capture volume");
 	if (ok)
 		mVolLevel = level;
+	armIdle();
 	IOLockUnlock(mLock);
 	return ok;
 }
@@ -1610,6 +1717,7 @@ bool VoodooHDASof::setCaptureMute(bool mute)
 	bool ok = sendCtrl(SOF_REPLAY_SWITCH, mute ? 0 : 1, "capture switch");
 	if (ok)
 		mMuted = mute;
+	armIdle();
 	IOLockUnlock(mLock);
 	return ok;
 }
@@ -1669,13 +1777,44 @@ bool VoodooHDASof::start()
 		teardownTopology();
 		return true;
 	}
-	SOFLOG("ready: firmware booted, topology loaded, DMIC buffers allocated");
+	SOFLOG("ready: firmware booted, topology loaded, DMIC buffers allocated%s",
+	       mPmEnabled ? "" : " (idle D0i3 off: voodoosofpm=0)");
+	if (mPmEnabled) {
+		mIdleLoop = IOWorkLoop::workLoop();
+		mIdleTimer = mIdleLoop ? IOTimerEventSource::timerEventSource(this, &VoodooHDASof::idleFired) : NULL;
+		if (!mIdleTimer || mIdleLoop->addEventSource(mIdleTimer) != kIOReturnSuccess) {
+			SOFLOG("warning: no idle timer, DSP stays in D0i0");
+			if (mIdleTimer) {
+				mIdleTimer->release();
+				mIdleTimer = NULL;
+			}
+		}
+	}
+	IOLockLock(mLock);
+	armIdle();
+	IOLockUnlock(mLock);
 	return true;
 }
 
 void VoodooHDASof::stop()
 {
 	SOFDBG("stop");
+	if (mLock) {
+		IOLockLock(mLock);
+		mStopping = true;
+		IOLockUnlock(mLock);
+	}
+	if (mIdleTimer) {				/* idleFired takes mLock: not held here */
+		mIdleTimer->cancelTimeout();
+		if (mIdleLoop)
+			mIdleLoop->removeEventSource(mIdleTimer);	/* waits for a running action */
+		mIdleTimer->release();
+		mIdleTimer = NULL;
+	}
+	if (mIdleLoop) {
+		mIdleLoop->release();
+		mIdleLoop = NULL;
+	}
 	if (mLock)
 		IOLockLock(mLock);
 	powerDownDsp();
