@@ -15,8 +15,7 @@
  *   voodoosofstep=N     stop after milestone step N (default: highest implemented)
  *                       1 = read-only probe, 2 = DSP power-up + ROM init (then power down again),
  *                       3 = full firmware load until FW_READY, 4 = + IPC topology replay (and free),
- *                       5 = + DMIC capture with RMS logging for SOF_DMIC_LOG_SECONDS, then stop,
- *                       6 = normal: topology loaded, "Dahili Mikrofon" engine starts/stops capture
+ *                       5 = normal: topology loaded, "Dahili Mikrofon" engines start/stop capture
  */
 
 #ifndef _VOODOO_HDA_SOF_H
@@ -152,7 +151,6 @@ struct _DmaMemory;
 #define SOF_DMIC_RATE			48000
 #define SOF_DMIC_CHANNELS		2
 #define SOF_DMIC_FRAME_BYTES		4
-#define SOF_DMIC_LOG_SECONDS		300
 /* PCM_PARAMS payload offsets (after the 8-byte sof_ipc_cmd_hdr) */
 #define SOF_PCMP_PHY_ADDR		24
 #define SOF_PCMP_PAGES			28
@@ -190,8 +188,7 @@ enum {
 	kSofStepRom = 2,	/* M2a: core 0 power-up + ROM init, then power down again */
 	kSofStepFw = 3,		/* M2b: code loader DMA, FW_ENTERED, FW_READY */
 	kSofStepIpc = 4,	/* M3a: mailbox windows, replay topology #0-19, free it again #24-31 */
-	kSofStepCapture = 5,	/* M3b: + DMIC host stream, PCM_PARAMS, TRIG_START, RMS log, stop */
-	kSofStepEngine = 6,	/* M4: topology stays loaded, "Dahili Mikrofon" engine drives capture */
+	kSofStepEngine = 5,	/* M4: topology stays loaded, "Dahili Mikrofon" engines drive capture */
 	kSofStepMax = kSofStepEngine
 };
 
@@ -257,8 +254,8 @@ private:
 	UInt16 mSavedDevc;
 	bool mSavedEm2L1;
 	UInt8 mSavedLtrp;
-	bool mLow4G;			/* experiment: DMA buffers below 4 GB */
-	bool mLinuxIntBits;		/* experiment: SD int enables + BDL IOC exactly like Linux */
+	bool mLow4G;			/* next allocDma below 4 GB (DMIC buffer + page table) */
+	bool mLinuxIntBits;		/* SD int enables + BDL IOC exactly like Linux (always on) */
 	SofStream mLoader;		/* code loader (playback) */
 	SofStream mIccmax;		/* ICCMAX workaround (capture) */
 
@@ -270,12 +267,7 @@ private:
 	bool mCapturing;		/* host DMA + TRIG_START done */
 	SofStream mDmic;		/* DMIC host capture stream */
 	struct _DmaMemory *mPageTable;
-	IOWorkLoop *mWorkLoop;
-	IOTimerEventSource *mTimer;
-	UInt32 mTicks;
-	UInt32 mLastLdp;
 	UInt32 mNotifyCount;
-	bool mNsnpFallback;
 	UInt32 mLdp0;			/* host DMA linear position at capture start */
 	IOLock *mLock;			/* IPC + capture state (engine runs on the audio workloop) */
 	UInt32 mVolLevel;		/* last capture volume step sent */
@@ -356,8 +348,6 @@ private:
 	void dmicHwStop();
 	bool dmicStart();
 	void dmicStop();
-	void logCapture();
-	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
 };
 
 #endif /* _VOODOO_HDA_SOF_H */
