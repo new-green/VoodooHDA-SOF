@@ -21,7 +21,9 @@ class IOAudioControl;
 
 /* noise reduction of the second engine (RNNoise, mono) */
 enum { kSofNrOff = 0, kSofNrLight = 1, kSofNrStrong = 2 };
-#define SOF_NR_LIGHT_FLOOR		0.1f	/* band gains floored at -20 dB */
+#define SOF_NR_STRENGTH_MAX		100	/* user strength 0..100 %: band gain floor = -0.4 dB per % (100 = no floor) */
+#define SOF_NR_STRENGTH_LIGHT		50	/* -20 dB, default */
+#define SOF_NR_STRENGTH_KEY		"SofNrStrength"	/* registry property, set from user space (SofMicBar) */
 #define SOF_RING_FRAMES			(SOF_DMIC_BUF_SIZE / SOF_DMIC_FRAME_BYTES)
 #define SOF_NR_RESYNC_FRAMES		4096	/* a bigger jump in the read position restarts the denoiser */
 #define SOF_NR_LIMIT			29204.0f	/* -1 dBFS in 16-bit scale */
@@ -38,6 +40,7 @@ public:
 	virtual void free() override;
 	virtual bool initHardware(IOService *provider) override;
 	virtual void stop(IOService *provider) override;
+	virtual IOReturn setProperties(OSObject *properties) override;
 
 	virtual IOReturn performAudioEngineStart() override;
 	virtual IOReturn performAudioEngineStop() override;
@@ -71,6 +74,8 @@ private:
 	double mHpX1, mHpX2, mHpY1, mHpY2;	/* 90 Hz high-pass before RNNoise */
 	float mLimGain;				/* peak limiter after RNNoise */
 	UInt32 mLimHits;
+	volatile UInt32 mNrStrength;		/* requested by setProperties */
+	UInt32 mNrStrengthApplied;		/* in RNNoise (set under mNrLock) */
 	void nrReset();
 
 	void pollPosition();

@@ -21,6 +21,27 @@
 #define super IOAudioEngine
 OSDefineMetaClassAndStructors(VoodooHDASofEngine, IOAudioEngine)
 
+/* RNNoise band gain floor per strength %: 10^(-0.02 * pct), 100 % = 0 (no floor); no libm in the kernel */
+static const float kSofNrFloor[SOF_NR_STRENGTH_MAX + 1] = {
+	1.000000e+00f, 9.549926e-01f, 9.120108e-01f, 8.709636e-01f, 8.317638e-01f, 7.943282e-01f,
+	7.585776e-01f, 7.244360e-01f, 6.918310e-01f, 6.606934e-01f, 6.309573e-01f, 6.025596e-01f,
+	5.754399e-01f, 5.495409e-01f, 5.248075e-01f, 5.011872e-01f, 4.786301e-01f, 4.570882e-01f,
+	4.365158e-01f, 4.168694e-01f, 3.981072e-01f, 3.801894e-01f, 3.630781e-01f, 3.467369e-01f,
+	3.311311e-01f, 3.162278e-01f, 3.019952e-01f, 2.884032e-01f, 2.754229e-01f, 2.630268e-01f,
+	2.511886e-01f, 2.398833e-01f, 2.290868e-01f, 2.187762e-01f, 2.089296e-01f, 1.995262e-01f,
+	1.905461e-01f, 1.819701e-01f, 1.737801e-01f, 1.659587e-01f, 1.584893e-01f, 1.513561e-01f,
+	1.445440e-01f, 1.380384e-01f, 1.318257e-01f, 1.258925e-01f, 1.202264e-01f, 1.148154e-01f,
+	1.096478e-01f, 1.047129e-01f, 1.000000e-01f, 9.549926e-02f, 9.120108e-02f, 8.709636e-02f,
+	8.317638e-02f, 7.943282e-02f, 7.585776e-02f, 7.244360e-02f, 6.918310e-02f, 6.606934e-02f,
+	6.309573e-02f, 6.025596e-02f, 5.754399e-02f, 5.495409e-02f, 5.248075e-02f, 5.011872e-02f,
+	4.786301e-02f, 4.570882e-02f, 4.365158e-02f, 4.168694e-02f, 3.981072e-02f, 3.801894e-02f,
+	3.630781e-02f, 3.467369e-02f, 3.311311e-02f, 3.162278e-02f, 3.019952e-02f, 2.884032e-02f,
+	2.754229e-02f, 2.630268e-02f, 2.511886e-02f, 2.398833e-02f, 2.290868e-02f, 2.187762e-02f,
+	2.089296e-02f, 1.995262e-02f, 1.905461e-02f, 1.819701e-02f, 1.737801e-02f, 1.659587e-02f,
+	1.584893e-02f, 1.513561e-02f, 1.445440e-02f, 1.380384e-02f, 1.318257e-02f, 1.258925e-02f,
+	1.202264e-02f, 1.148154e-02f, 1.096478e-02f, 1.047129e-02f, 0.000000e+00f
+};
+
 bool VoodooHDASofEngine::initWithSof(VoodooHDASof *sof, UInt32 nrMode)
 {
 	if (!super::init(NULL) || !sof || !sof->captureBuffer() || nrMode > kSofNrStrong)
@@ -37,10 +58,12 @@ bool VoodooHDASofEngine::initWithSof(VoodooHDASof *sof, UInt32 nrMode)
 	mNrOut = (float *)IOMalloc(SOF_RING_FRAMES * sizeof(float));
 	if (!mNrLock || !mNrIn || !mNrBlk || !mNrOut)
 		return false;
-	if (rnnk_init(mNrMode == kSofNrLight ? SOF_NR_LIGHT_FLOOR : 0.0f) != 0) {
+	mNrStrength = mNrStrengthApplied = mNrMode == kSofNrStrong ? SOF_NR_STRENGTH_MAX : SOF_NR_STRENGTH_LIGHT;
+	if (rnnk_init(kSofNrFloor[mNrStrengthApplied]) != 0) {
 		ENGLOG("error: RNNoise init failed");
 		return false;
 	}
+	setProperty(SOF_NR_STRENGTH_KEY, mNrStrength, 32);
 	return true;
 }
 
@@ -120,8 +143,36 @@ bool VoodooHDASofEngine::initHardware(IOService *provider)
 		return false;
 	}
 	ENGLOG("ready: 48 kHz, 2 ch, S16LE, %u frames%s", (unsigned)(SOF_DMIC_BUF_SIZE / SOF_DMIC_FRAME_BYTES),
-	       mNrMode == kSofNrOff ? "" : mNrMode == kSofNrLight ? ", noise reduction light" : ", noise reduction strong");
+	       mNrMode == kSofNrOff ? "" : ", noise reduction");
+	if (mNrMode != kSofNrOff)
+		ENGLOG("noise reduction strength %u %% (default)", (unsigned)mNrStrength);
 	return true;
+}
+
+/*
+ * Noise reduction strength from user space (SofMicBar):
+ * IORegistryEntrySetCFProperties(engine, { "SofNrStrength" = 0..100 }).
+ * Only stored here; convertInputSamples hands the new floor to RNNoise under mNrLock.
+ */
+IOReturn VoodooHDASofEngine::setProperties(OSObject *properties)
+{
+	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+	OSNumber *num;
+	UInt32 pct;
+
+	if (!dict || mNrMode == kSofNrOff)
+		return kIOReturnUnsupported;
+	num = OSDynamicCast(OSNumber, dict->getObject(SOF_NR_STRENGTH_KEY));
+	if (!num)
+		return kIOReturnUnsupported;
+	pct = num->unsigned32BitValue();
+	if (pct > SOF_NR_STRENGTH_MAX)
+		return kIOReturnBadArgument;
+	if (pct != mNrStrength)
+		ENGLOG("noise reduction strength %u %%", (unsigned)pct);
+	mNrStrength = pct;
+	setProperty(SOF_NR_STRENGTH_KEY, pct, 32);
+	return kIOReturnSuccess;
 }
 
 /* "Input level" slider (-50..+20 dB, 1 dB steps, bottom = mute) and input mute, both channels together */
@@ -337,6 +388,11 @@ IOReturn VoodooHDASofEngine::convertInputSamples(const void *sampleBuf, void *de
 	}
 
 	IOLockLock(mNrLock);
+	UInt32 want = mNrStrength;
+	if (want != mNrStrengthApplied && want <= SOF_NR_STRENGTH_MAX) {
+		rnnk_set_floor(kSofNrFloor[want]);
+		mNrStrengthApplied = want;
+	}
 	UInt32 end = (firstSampleFrame + numSampleFrames) % SOF_RING_FRAMES;
 	if (!mNrSync || (end + SOF_RING_FRAMES - mNrInPos) % SOF_RING_FRAMES > SOF_NR_RESYNC_FRAMES) {
 		/* (re)start: output stays silent until the first block lands (<= 20 ms) */
