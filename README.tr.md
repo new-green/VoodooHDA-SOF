@@ -14,7 +14,7 @@ Alder Lake ve diğer yeni Intel laptoplarda dahili mikrofonlar HDA ses kodeğine
 
 - **Internal Microphone (Dahili Mikrofon)**: DMIC çifti, 48 kHz, 2 kanal, 16 bit. Sistem Ayarları'ndaki giriş seviyesi kaydırıcısı (−50…+20 dB, DSP kazancı) ve sessize alma çalışır.
 - **Internal Microphone (Noise Reduction) / Dahili Mikrofon (Gürültü Azaltma)**: aynı akış üzerinde ikinci bir giriş cihazı. Sırasıyla 90 Hz yüksek geçiren filtre, [RNNoise](https://github.com/xiph/rnnoise) (çekirdekte çalışır, tek çekirdeğin yaklaşık %1–2'si) ve −1 dBFS limiter uygular. İki cihaz aynı anda kullanılabilir. Seviye ve sessize alma ikisinde eşli kalır.
-- **SofMicBar**: canlı bir gürültü azaltma gücü kaydırıcısı (%0–100) ve sessize alma düğmesi olan menü çubuğu uygulaması (macOS'ta girişi sessize alma düğmesi yoktur). Oturum açılışında başlayabilir.
+- **SofMicBar**: canlı bir gürültü azaltma gücü kaydırıcısı (%0–100) ve sessize alma düğmesi olan menü çubuğu uygulaması (macOS'ta girişi sessize alma düğmesi yoktur). **⌃⌥M** (Control-Option-M) kısayolu her uygulamada mikrofonu sessize alır ve açar. Bu kısayol menüden kapatılabilir. Oturum açılışında başlayabilir.
 - **Boşta güç tasarrufu**: son kayıt bittikten 5 sn sonra DSP D0i3 uyku moduna geçer. Bir uygulama kayda başlayınca yaklaşık 7 ms'de uyanır.
 - VoodooHDA'nın mevcut özellikleri (HDA kodek, hoparlör, kulaklık, jak mikrofonu) değişmedi. `-voodoosof` açılış parametresi olmadan SOF kodunun hiçbiri çalışmaz.
 

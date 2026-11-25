@@ -14,7 +14,7 @@ On Alder Lake and other recent Intel laptops, the internal microphones are not o
 
 - **Internal Microphone**: the DMIC pair, 48 kHz, 2 ch, 16 bit. The input volume slider in System Settings works (−50…+20 dB, DSP gain), and mute works too.
 - **Internal Microphone (Noise Reduction)**: a second input device on the same stream. It applies a 90 Hz high-pass, [RNNoise](https://github.com/xiph/rnnoise) (running in the kernel, about 1–2 % of one core), and a −1 dBFS limiter. Both devices can be used at the same time, and their level and mute stay in sync.
-- **SofMicBar**: a menu bar app with a live noise-reduction strength slider (0–100 %) and a mute toggle (macOS has no input mute button). It can start at login.
+- **SofMicBar**: a menu bar app with a live noise-reduction strength slider (0–100 %) and a mute toggle (macOS has no input mute button). The global shortcut **⌃⌥M** (Control-Option-M) mutes and unmutes from any app and can be turned off in the menu. It can start at login.
 - **Idle power saving**: 5 s after the last recording stops, the DSP goes into D0i3. It wakes in about 7 ms when an app starts recording.
 - The existing VoodooHDA features (HDA codec, speakers, headphones, jack mic) are unchanged. Without the `-voodoosof` boot-arg, none of the SOF code runs.
 

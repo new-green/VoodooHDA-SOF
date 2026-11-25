@@ -6,6 +6,7 @@
 import AppKit
 import IOKit
 import CoreAudio
+import Carbon.HIToolbox
 
 let kKey = "SofNrStrength"
 let kDefaultsKey = "nrStrength"
@@ -77,6 +78,25 @@ func writeMute(_ on: Bool) -> Bool {
     return ok
 }
 
+// global mute shortcut ⌃⌥M (Carbon hot key: works in every app, needs no Accessibility permission)
+let kHotKeyDefaultsKey = "muteHotKey"	// false = off
+var hotKeyRef: EventHotKeyRef?
+var hotKeyHandler: EventHandlerRef?
+
+func setMuteHotKey(_ on: Bool) {
+    if let r = hotKeyRef { UnregisterEventHotKey(r); hotKeyRef = nil }
+    guard on else { return }
+    if hotKeyHandler == nil {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async { (NSApp.delegate as? App)?.toggleMute() }
+            return noErr
+        }, 1, &spec, nil, &hotKeyHandler)
+    }
+    let id = EventHotKeyID(signature: OSType(0x534F464D), id: 1)	/* 'SOFM' */
+    RegisterEventHotKey(UInt32(kVK_ANSI_M), UInt32(controlKey | optionKey), id, GetApplicationEventTarget(), 0, &hotKeyRef)
+}
+
 @discardableResult
 func writeStrength(_ pct: Int) -> Bool {
     guard let s = findNrEngine() else { return false }
@@ -93,6 +113,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let loginItem = NSMenuItem(title: L("Açılışta başlat", "Start at login"), action: #selector(toggleLogin), keyEquivalent: "")
     let muteItem = NSMenuItem(title: L("Mikrofonu sessize al", "Mute microphone"), action: #selector(toggleMute), keyEquivalent: "m")
+    let hotKeyItem = NSMenuItem(title: L("Kısayol ⌃⌥M (her uygulamada)", "Shortcut ⌃⌥M (in every app)"), action: #selector(toggleHotKey), keyEquivalent: "")
+    var hotKeyOn: Bool {
+        get { UserDefaults.standard.object(forKey: kHotKeyDefaultsKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: kHotKeyDefaultsKey) }
+    }
     var watched = Set<AudioDeviceID>()
     var lastSent = -1
     var retries = 0
@@ -106,6 +131,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateIcon(muted: false)
 
         muteItem.target = self
+        muteItem.keyEquivalentModifierMask = [.control, .option]
         menu.addItem(muteItem)
         menu.addItem(.separator())
 
@@ -131,12 +157,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusLine.isEnabled = false
         menu.addItem(statusLine)
         menu.addItem(.separator())
+        hotKeyItem.target = self
+        menu.addItem(hotKeyItem)
         loginItem.target = self
         menu.addItem(loginItem)
         menu.addItem(NSMenuItem(title: L("Çık", "Quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         menu.delegate = self
         item.menu = menu
 
+        setMuteHotKey(hotKeyOn)
+        hotKeyItem.state = hotKeyOn ? .on : .off
         slider.integerValue = saved
         updateLabel()
         pushSaved()
@@ -171,6 +201,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                      accessibilityDescription: muted ? L("Mikrofon sessiz", "Microphone muted") : L("Mikrofon açık", "Microphone on"))
         item.button?.toolTip = muted ? L("Dahili Mikrofon — sessiz", "Internal Microphone — muted")
                                      : L("Dahili Mikrofon — gürültü azaltma", "Internal Microphone — noise reduction")
+    }
+
+    @objc func toggleHotKey() {
+        hotKeyOn.toggle()
+        setMuteHotKey(hotKeyOn)
+        hotKeyItem.state = hotKeyOn ? .on : .off
     }
 
     @objc func toggleMute() {

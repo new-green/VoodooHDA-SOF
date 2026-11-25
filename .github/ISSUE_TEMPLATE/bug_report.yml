@@ -1,0 +1,75 @@
+name: Bug report / Hata bildirimi
+description: The internal microphone does not work or misbehaves / Dahili mikrofon çalışmıyor veya sorun çıkarıyor
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! This driver is experimental and has only been tested on an HP ProBook 440 G9.
+        Test ettiğiniz için teşekkürler! Bu sürücü deneyseldir ve yalnızca HP ProBook 440 G9'da test edildi.
+  - type: input
+    id: laptop
+    attributes:
+      label: Laptop model / Laptop modeli
+      placeholder: HP ProBook 440 G9
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU / İşlemci
+      placeholder: Intel Core i5-1235U (Alder Lake-P)
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version / macOS sürümü
+      placeholder: macOS Tahoe 26.7.3 (25G342)
+    validations:
+      required: true
+  - type: input
+    id: kext
+    attributes:
+      label: Kext version / Kext sürümü
+      description: "`kextstat | grep VoodooHDA`"
+    validations:
+      required: true
+  - type: input
+    id: bootargs
+    attributes:
+      label: boot-args
+      description: "`nvram boot-args`"
+  - type: input
+    id: pciid
+    attributes:
+      label: Audio controller PCI ID / Ses denetleyicisi PCI kimliği
+      description: |
+        System Information → PCI, or on Linux `lspci -nn | grep -i audio` (e.g. 8086:51c8)
+        Sistem Bilgisi → PCI veya Linux'ta `lspci -nn | grep -i audio` (örn. 8086:51c8)
+  - type: dropdown
+    id: linux
+    attributes:
+      label: Does the internal mic work on Linux with SOF? / Dahili mikrofon Linux'ta SOF ile çalışıyor mu?
+      options:
+        - "Yes / Evet"
+        - "No / Hayır"
+        - "Not tested / Denenmedi"
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened? / Ne oldu?
+      description: What did you expect, what happened instead? / Ne bekliyordunuz, ne oldu?
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Kext log / Kext log'u
+      description: |
+        `/usr/bin/log show --last boot --predicate 'eventMessage CONTAINS "VoodooHDA SOF"' --style compact`
+        If the problem is unclear, boot once with `-voodoosofdbg` and paste that log.
+        Sorun belirsizse bir kez `-voodoosofdbg` ile açıp o log'u yapıştırın.
+      render: text
+    validations:
+      required: true
