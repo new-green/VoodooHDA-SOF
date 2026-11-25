@@ -13,6 +13,9 @@
 #include <IOKit/audio/IOAudioDefines.h>
 #include <IOKit/audio/IOAudioLevelControl.h>
 #include <IOKit/audio/IOAudioToggleControl.h>
+#include <IOKit/audio/IOAudioSelectorControl.h>
+
+#include "rnnoise/rnnoise_kern.h"
 
 #define ENGLOG(fmt, ...)	IOLog("VoodooHDA SOF engine: " fmt "\n", ##__VA_ARGS__)
 
@@ -25,6 +28,17 @@ bool VoodooHDASofEngine::initWithSof(VoodooHDASof *sof)
 		return false;
 	mSof = sof;
 	mSof->retain();
+	mNrMode = kSofNrOff;
+	mNrLock = IOLockAlloc();
+	mNrIn = (float *)IOMalloc(RNNK_FRAME * sizeof(float));
+	mNrBlk = (float *)IOMalloc(RNNK_FRAME * sizeof(float));
+	mNrOut = (float *)IOMalloc(SOF_RING_FRAMES * sizeof(float));
+	if (!mNrLock || !mNrIn || !mNrBlk || !mNrOut)
+		return false;
+	if (rnnk_init(SOF_NR_LIGHT_FLOOR) != 0) {
+		ENGLOG("error: RNNoise init failed");
+		return false;
+	}
 	return true;
 }
 
@@ -37,6 +51,17 @@ void VoodooHDASofEngine::free()
 	if (mSof) {
 		mSof->release();
 		mSof = NULL;
+	}
+	if (mNrIn)
+		IOFree(mNrIn, RNNK_FRAME * sizeof(float));
+	if (mNrBlk)
+		IOFree(mNrBlk, RNNK_FRAME * sizeof(float));
+	if (mNrOut)
+		IOFree(mNrOut, SOF_RING_FRAMES * sizeof(float));
+	mNrIn = mNrBlk = mNrOut = NULL;
+	if (mNrLock) {
+		IOLockFree(mNrLock);
+		mNrLock = NULL;
 	}
 	super::free();
 }
@@ -117,7 +142,36 @@ bool VoodooHDASofEngine::createControls()
 	mute->setValueChangeHandler(&VoodooHDASofEngine::muteChanged, this);
 	addDefaultAudioControl(mute);
 	mute->release();
+
+	/* input source = noise reduction mode; shown as separate inputs in Sound settings */
+	IOAudioSelectorControl *src = IOAudioSelectorControl::createInputSelector(kSofNrOff,
+			kIOAudioControlChannelIDAll, kIOAudioControlChannelNameAll, 0);
+	if (!src)
+		return false;
+	src->addAvailableSelection(kSofNrOff, "Dahili Mikrofon");
+	src->addAvailableSelection(kSofNrLight, "Dahili Mikrofon (Gürültü Azaltma - hafif)");
+	src->addAvailableSelection(kSofNrStrong, "Dahili Mikrofon (Gürültü Azaltma - güçlü)");
+	src->setValueChangeHandler(&VoodooHDASofEngine::sourceChanged, this);
+	addDefaultAudioControl(src);
+	src->release();
 	return true;
+}
+
+IOReturn VoodooHDASofEngine::sourceChanged(OSObject *target, IOAudioControl *, SInt32 oldValue, SInt32 newValue)
+{
+	VoodooHDASofEngine *self = OSDynamicCast(VoodooHDASofEngine, target);
+
+	if (!self || (newValue != kSofNrOff && newValue != kSofNrLight && newValue != kSofNrStrong))
+		return kIOReturnBadArgument;
+	IOLockLock(self->mNrLock);
+	if (newValue != kSofNrOff)
+		rnnk_set_floor(newValue == kSofNrLight ? SOF_NR_LIGHT_FLOOR : 0.0f);
+	if (self->mNrMode == kSofNrOff)
+		self->mNrSync = false;		/* start clean when switching on */
+	self->mNrMode = newValue;
+	IOLockUnlock(self->mNrLock);
+	ENGLOG("noise reduction: %s", newValue == kSofNrOff ? "off" : newValue == kSofNrLight ? "light" : "strong");
+	return kIOReturnSuccess;
 }
 
 IOReturn VoodooHDASofEngine::volumeChanged(OSObject *target, IOAudioControl *, SInt32 oldValue, SInt32 newValue)
@@ -163,6 +217,10 @@ IOReturn VoodooHDASofEngine::performAudioEngineStart()
 	mRunning = true;
 	mLastFrame = 0;
 	mWraps = 0;
+	IOLockLock(mNrLock);
+	mNrSync = false;
+	mNrBlocks = 0;
+	IOLockUnlock(mNrLock);
 	takeTimeStamp(false);
 	if (mPosTimer)
 		mPosTimer->setTimeoutMS(SOF_ENGINE_POLL_MS);
@@ -178,7 +236,7 @@ IOReturn VoodooHDASofEngine::performAudioEngineStop()
 		mRunning = false;
 		mSof->captureStop();
 	}
-	ENGLOG("stopped after %u buffer wraps", (unsigned)mWraps);
+	ENGLOG("stopped after %u buffer wraps (%u denoised blocks)", (unsigned)mWraps, (unsigned)mNrBlocks);
 	return kIOReturnSuccess;
 }
 
@@ -198,6 +256,33 @@ IOReturn VoodooHDASofEngine::performFormatChange(IOAudioStream *, const IOAudioS
 	return kIOReturnSuccess;
 }
 
+/*
+ * Feed the denoiser with the ring frames [mNrInPos, endFrame). Input block [s, s+480) comes out
+ * (RNNoise adds one frame of delay) at ring positions [s+480, s+960): every output frame then
+ * only depends on input that is older than itself, which the HAL never reads ahead of.
+ * Latency: +20 ms. Caller holds mNrLock.
+ */
+void VoodooHDASofEngine::nrFeed(const SInt16 *ring, UInt32 endFrame)
+{
+	UInt32 todo = (endFrame + SOF_RING_FRAMES - mNrInPos) % SOF_RING_FRAMES;
+
+	while (todo--) {
+		const SInt16 *f = ring + mNrInPos * SOF_DMIC_CHANNELS;
+		if (mNrFill == 0)
+			mNrBlockStart = mNrInPos;
+		mNrIn[mNrFill++] = 0.5f * ((float)f[0] + (float)f[1]);	/* RNNoise works in 16-bit scale */
+		mNrInPos = (mNrInPos + 1) % SOF_RING_FRAMES;
+		if (mNrFill == RNNK_FRAME) {
+			rnnk_process(mNrBlk, mNrIn);
+			UInt32 o = (mNrBlockStart + RNNK_FRAME) % SOF_RING_FRAMES;
+			for (UInt32 i = 0; i < RNNK_FRAME; i++)
+				mNrOut[(o + i) % SOF_RING_FRAMES] = mNrBlk[i];
+			mNrFill = 0;
+			mNrBlocks++;
+		}
+	}
+}
+
 IOReturn VoodooHDASofEngine::convertInputSamples(const void *sampleBuf, void *destBuf, UInt32 firstSampleFrame,
 		UInt32 numSampleFrames, const IOAudioStreamFormat *, IOAudioStream *)
 {
@@ -206,8 +291,28 @@ IOReturn VoodooHDASofEngine::convertInputSamples(const void *sampleBuf, void *de
 	UInt32 n = numSampleFrames * SOF_DMIC_CHANNELS;
 	const float scale = 1.0f / 32768.0f;
 
-	for (UInt32 i = 0; i < n; i++)
-		dst[i] = (float)src[i] * scale;
+	if (mNrMode == kSofNrOff || firstSampleFrame >= SOF_RING_FRAMES || numSampleFrames > SOF_RING_FRAMES / 2) {
+		for (UInt32 i = 0; i < n; i++)
+			dst[i] = (float)src[i] * scale;
+		return kIOReturnSuccess;
+	}
+
+	IOLockLock(mNrLock);
+	UInt32 end = (firstSampleFrame + numSampleFrames) % SOF_RING_FRAMES;
+	if (!mNrSync || (end + SOF_RING_FRAMES - mNrInPos) % SOF_RING_FRAMES > SOF_NR_RESYNC_FRAMES) {
+		/* (re)start: output stays silent until the first block lands (<= 20 ms) */
+		bzero(mNrOut, SOF_RING_FRAMES * sizeof(float));
+		mNrInPos = firstSampleFrame;
+		mNrFill = 0;
+		mNrSync = true;
+	}
+	nrFeed((const SInt16 *)sampleBuf, end);
+	for (UInt32 i = 0; i < numSampleFrames; i++) {
+		float v = mNrOut[(firstSampleFrame + i) % SOF_RING_FRAMES] * scale;
+		dst[2 * i] = v;
+		dst[2 * i + 1] = v;
+	}
+	IOLockUnlock(mNrLock);
 	return kIOReturnSuccess;
 }
 

@@ -13,7 +13,7 @@ OBJ="$OUT/obj"
 KEXT="$OUT/VoodooHDA.kext"
 
 BUNDLE_ID=org.voodoo.driver.VoodooHDA
-KEXT_VERSION="${KEXT_VERSION:-3.6.9d6}"
+KEXT_VERSION="${KEXT_VERSION:-3.6.9d7}"
 MIN_OS=10.13
 
 SDK="${SDK:-$(xcrun --sdk macosx --show-sdk-path)}"
@@ -50,6 +50,13 @@ SOURCES=(
   "PCMBlitterLibX86.cpp|-fvisibility=hidden"
   "VoodooHDASof.cpp|"
   "VoodooHDASofEngine.cpp|-Wno-deprecated-declarations -Wno-inconsistent-missing-override"
+  # RNNoise v0.1.1 (BSD-3-Clause), kernel build: no fast-math (NaN checks), no libm, no VLAs
+  "rnnoise/denoise.c|-fno-fast-math -fno-math-errno -w"
+  "rnnoise/rnn.c|-fno-fast-math -fno-math-errno -w"
+  "rnnoise/rnn_data.c|-w"
+  "rnnoise/pitch.c|-fno-fast-math -fno-math-errno -w"
+  "rnnoise/celt_lpc.c|-fno-fast-math -fno-math-errno -w"
+  "rnnoise/kiss_fft.c|-fno-fast-math -fno-math-errno -w"
 )
 
 rm -rf "$OUT"; mkdir -p "$OBJ"
@@ -57,6 +64,7 @@ objs=()
 for entry in "${SOURCES[@]}"; do
   f="${entry%%|*}"; extra="${entry#*|}"
   o="$OBJ/${f%.*}.o"
+  mkdir -p "$(dirname "$o")"
   if [[ "$f" == *.c ]]; then lang=("${CFLAGS[@]}"); else lang=("${CXXFLAGS[@]}"); fi
   echo "  CC  $f"
   # shellcheck disable=SC2086
@@ -131,7 +139,7 @@ xcrun clang -arch x86_64 -isysroot "$SDK" -mmacosx-version-min=$MIN_OS -flto \
   -o "$KEXT/Contents/MacOS/VoodooHDA"
 
 # Our own symbols must never be left undefined (kext linking defers them to load time)
-if nm -u "$KEXT/Contents/MacOS/VoodooHDA" | grep -E '_gSof|VoodooHDASof' ; then
+if nm -u "$KEXT/Contents/MacOS/VoodooHDA" | grep -E '_gSof|VoodooHDASof|_rnnk|_rnn_|_rnnoise|_celt|_compute_rnn' ; then
   echo "error: unresolved SOF symbols above"; exit 1
 fi
 
