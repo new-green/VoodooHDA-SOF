@@ -189,6 +189,8 @@ struct _DmaMemory;
 #define SOF_BOOT_TIMEOUT_US		2000000
 #define SOF_STREAM_RUN_TIMEOUT_US	300
 #define SOF_FW_BOOT_ATTEMPTS		3
+#define SOF_FW_DOWNLOAD_ATTEMPTS	3	/* whole load again when the ROM halts during the code loader DMA */
+#define SOF_FW_RETRY_DELAY_MS		20
 
 #define SOF_CORE0			1U	/* init_core_mask == host_managed_cores_mask */
 

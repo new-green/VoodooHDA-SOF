@@ -938,7 +938,7 @@ bool VoodooHDASof::traceCopy(UInt32 *lastFsr)
 bool VoodooHDASof::bootFirmware()
 {
 	const UInt8 *fw = gSofFirmware;
-	UInt32 fwSize = gSofFirmwareSize, payload = 0, v;
+	UInt32 fwSize = gSofFirmwareSize, payload = 0, v = 0;
 	int attempt;
 
 	/* ext manifest: payload starts after it (sof_ipc3_fw_parse_ext_man) */
@@ -1004,46 +1004,60 @@ bool VoodooHDASof::bootFirmware()
 	 */
 	mLow4G = false;
 	mLinuxIntBits = true;
-	if (!pickStreams()) {
-		abortBoot("no streams");
-		return false;
-	}
-	if (!iccmaxStart()) {			/* ICCMAX workaround stream */
-		abortBoot("ICCMAX stream");
-		return false;
-	}
-	if (!loaderPrepare(fw + payload, fwSize - payload)) {
-		abortBoot("code loader stream");
-		return false;
-	}
+	bool entered = false, stopped = false;
+	for (int dl = 1; dl <= SOF_FW_DOWNLOAD_ATTEMPTS && !entered; dl++) {
+		if (dl > 1) {
+			/* the ROM halted: core 0 off, streams back to idle, then the whole load again */
+			coreResetPowerDown(SOF_CORE0);
+			loaderCleanup();
+			iccmaxCleanup();
+			IOSleep(SOF_FW_RETRY_DELAY_MS);
+			SOFLOG("firmware download: attempt %d of %d", dl, SOF_FW_DOWNLOAD_ATTEMPTS);
+		}
+		if (!pickStreams()) {
+			abortBoot("no streams");
+			return false;
+		}
+		if (!iccmaxStart()) {			/* ICCMAX workaround stream */
+			abortBoot("ICCMAX stream");
+			return false;
+		}
+		if (!loaderPrepare(fw + payload, fwSize - payload)) {
+			abortBoot("code loader stream");
+			return false;
+		}
 
-	for (attempt = 1; attempt <= SOF_FW_BOOT_ATTEMPTS; attempt++) {
-		SOFDBG("core 0 / ROM init, attempt %d", attempt);
-		if (clDspInit(mLoader.tag))
-			break;
-	}
-	if (attempt > SOF_FW_BOOT_ATTEMPTS) {
-		abortBoot("ROM init failed");
-		return false;
-	}
+		for (attempt = 1; attempt <= SOF_FW_BOOT_ATTEMPTS; attempt++) {
+			SOFDBG("core 0 / ROM init, attempt %d", attempt);
+			if (clDspInit(mLoader.tag))
+				break;
+		}
+		if (attempt > SOF_FW_BOOT_ATTEMPTS) {
+			abortBoot("ROM init failed");
+			return false;
+		}
 
-	if (mStep < kSofStepFw) {
-		SOFLOG("step %u reached (ROM init OK), powering DSP down again", (unsigned)mStep);
-		dumpState("ROM init");
-		abortBoot("voodoosofstep");
-		dumpState("after power down");
-		return true;
-	}
+		if (mStep < kSofStepFw) {
+			SOFLOG("step %u reached (ROM init OK), powering DSP down again", (unsigned)mStep);
+			dumpState("ROM init");
+			abortBoot("voodoosofstep");
+			dumpState("after power down");
+			return true;
+		}
 
-	/* hda_cl_copy_fw() */
-	SOFDBG("code loader DMA starting");
-	loaderTrigger(true);
-	bool entered = traceCopy(&v);
-	bool stopped = loaderTrigger(false);
+		/* hda_cl_copy_fw() */
+		SOFDBG("code loader DMA starting");
+		loaderTrigger(true);
+		entered = traceCopy(&v);
+		stopped = loaderTrigger(false);
+		if (!entered) {
+			SOFLOG("error: no FW_ENTERED, ROM_STATUS %08x ROM_ERROR %08x (attempt %d)", (unsigned)v,
+			       (unsigned)dsp32(SOF_SRAM_ROM_ERROR), dl);
+			if (dl == 1 || mDbg)
+				dumpState("FW download failed");
+		}
+	}
 	if (!entered) {
-		SOFLOG("error: no FW_ENTERED, ROM_STATUS %08x ROM_ERROR %08x", (unsigned)v,
-		       (unsigned)dsp32(SOF_SRAM_ROM_ERROR));
-		dumpState("FW download failed");
 		abortBoot("firmware download");
 		return false;
 	}
