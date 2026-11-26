@@ -1002,7 +1002,12 @@ bool VoodooHDASof::bootFirmware()
 	 * Linux's exact streams (loader SD(ISS) tag 1, ICCMAX SD0 tag 1) with Linux's SD int enables
 	 * and BDL IOC. d5 showed other streams make the ROM halt after loading the manifests.
 	 */
-	mLow4G = false;
+	/*
+	 * Code loader + ICCMAX buffers and BDLs below 4 GB: with them at ~31 GB the ROM read the first
+	 * 32 KB (manifest) and halted (80000003) on every attempt (2026-11-26); the DMIC buffer has
+	 * always been below 4 GB.
+	 */
+	mLow4G = true;
 	mLinuxIntBits = true;
 	bool entered = false, stopped = false;
 	for (int dl = 1; dl <= SOF_FW_DOWNLOAD_ATTEMPTS && !entered; dl++) {
@@ -1057,6 +1062,7 @@ bool VoodooHDASof::bootFirmware()
 				dumpState("FW download failed");
 		}
 	}
+	mLow4G = false;
 	if (!entered) {
 		abortBoot("firmware download");
 		return false;

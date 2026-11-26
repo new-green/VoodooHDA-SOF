@@ -266,7 +266,7 @@ private:
 	UInt16 mSavedDevc;
 	bool mSavedEm2L1;
 	UInt8 mSavedLtrp;
-	bool mLow4G;			/* next allocDma below 4 GB (DMIC buffer + page table) */
+	bool mLow4G;			/* allocDma below 4 GB (boot streams, DMIC buffer + page table) */
 	bool mLinuxIntBits;		/* SD int enables + BDL IOC exactly like Linux (always on) */
 	SofStream mLoader;		/* code loader (playback) */
 	SofStream mIccmax;		/* ICCMAX workaround (capture) */
