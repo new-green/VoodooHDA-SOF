@@ -25,7 +25,9 @@ enum { kSofNrOff = 0, kSofNrLight = 1, kSofNrStrong = 2 };
 #define SOF_NR_STRENGTH_LIGHT		50	/* -20 dB, default */
 #define SOF_NR_STRENGTH_KEY		"SofNrStrength"	/* registry property, set from user space (SofMicBar) */
 #define SOF_RING_FRAMES			(SOF_DMIC_BUF_SIZE / SOF_DMIC_FRAME_BYTES)
-#define SOF_NR_RESYNC_FRAMES		4096	/* a bigger jump in the read position restarts the denoiser */
+#define SOF_NR_MAX_FEED			4096	/* a bigger forward jump skips ahead instead of denoising the gap */
+#define SOF_NR_MAX_AGE			(SOF_RING_FRAMES - 2048)	/* older input may be overwritten by DMA */
+#define SOF_NR_PREROLL			(2 * RNNK_FRAME)	/* fed before a (re)start point: no silent gap */
 #define SOF_NR_LIMIT			29204.0f	/* -1 dBFS in 16-bit scale */
 #define SOF_NR_LIMIT_RELEASE		0.000208312f	/* 100 ms at 48 kHz */
 
@@ -71,6 +73,9 @@ private:
 	float *mNrBlk;			/* RNNK_FRAME output frames */
 	float *mNrOut;			/* SOF_RING_FRAMES mono output, ring positions */
 	UInt32 mNrBlocks;
+	UInt32 mNrSkips;		/* forward jumps / overwritten input: skipped ahead */
+	UInt32 mNrBehind;		/* reads entirely inside already denoised frames */
+	UInt32 mNrMaxGap;		/* largest gap denoised in one read */
 	double mHpX1, mHpX2, mHpY1, mHpY2;	/* 90 Hz high-pass before RNNoise */
 	float mLimGain;				/* peak limiter after RNNoise */
 	UInt32 mLimHits;

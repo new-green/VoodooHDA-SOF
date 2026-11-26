@@ -279,6 +279,7 @@ IOReturn VoodooHDASofEngine::performAudioEngineStart()
 		mNrSync = false;
 		mNrBlocks = 0;
 		mLimHits = 0;
+		mNrSkips = mNrBehind = mNrMaxGap = 0;
 		IOLockUnlock(mNrLock);
 	}
 	/*
@@ -307,8 +308,12 @@ IOReturn VoodooHDASofEngine::performAudioEngineStop()
 		mRunning = false;
 		mSof->captureStop();
 	}
-	ENGLOG("stopped after %u buffer wraps (%u denoised blocks, %u limiter hits)", (unsigned)mWraps,
-	       (unsigned)mNrBlocks, (unsigned)mLimHits);
+	if (mNrLock)
+		ENGLOG("stopped after %u buffer wraps (%u denoised blocks, %u limiter hits, %u skips, %u re-reads, "
+		       "max gap %u)", (unsigned)mWraps, (unsigned)mNrBlocks, (unsigned)mLimHits, (unsigned)mNrSkips,
+		       (unsigned)mNrBehind, (unsigned)mNrMaxGap);
+	else
+		ENGLOG("stopped after %u buffer wraps", (unsigned)mWraps);
 	return kIOReturnSuccess;
 }
 
@@ -403,13 +408,35 @@ IOReturn VoodooHDASofEngine::convertInputSamples(const void *sampleBuf, void *de
 		rnnk_set_floor(kSofNrFloor[want]);
 		mNrStrengthApplied = want;
 	}
+	/*
+	 * The HAL does not always read in one monotonic sequence: IO contexts restart, cycles get
+	 * skipped after an overload, and reads can overlap. Judge every read against the DMA write
+	 * position: older than what was fed -> already denoised, just copy; a small step ahead ->
+	 * denoise up to it; a big jump or input the DMA may have overwritten -> skip ahead, keeping the
+	 * denoiser state and feeding a short pre-roll so [first, end) is valid at once (no reset).
+	 */
 	UInt32 end = (firstSampleFrame + numSampleFrames) % SOF_RING_FRAMES;
-	if (!mNrSync || (end + SOF_RING_FRAMES - mNrInPos) % SOF_RING_FRAMES > SOF_NR_RESYNC_FRAMES) {
-		/* (re)start: output stays silent until the first block lands (<= 20 ms) */
-		mNrInPos = firstSampleFrame;
+	UInt32 w = mSof->captureFrame();
+	UInt32 ageIn = (w + SOF_RING_FRAMES - mNrInPos) % SOF_RING_FRAMES;
+	UInt32 ageEnd = (w + SOF_RING_FRAMES - end) % SOF_RING_FRAMES;
+	UInt32 restart = (firstSampleFrame + SOF_RING_FRAMES - SOF_NR_PREROLL) % SOF_RING_FRAMES;
+	if (!mNrSync) {
 		nrReset();
+		mNrInPos = restart;
+	} else if (ageEnd >= ageIn) {
+		mNrBehind++;			/* nothing new to feed */
+	} else if (ageIn > SOF_NR_MAX_AGE || ageIn - ageEnd > SOF_NR_MAX_FEED) {
+		if (++mNrSkips <= 5)			/* rare; first few are worth a line */
+			ENGLOG("noise reduction: read jumped %u frames ahead (fed %u frames old), skipping ahead",
+			       (unsigned)(ageIn - ageEnd), (unsigned)ageIn);
+		mNrFill = 0;
+		mNrInPos = restart;
+	} else if (ageIn - ageEnd > mNrMaxGap) {
+		mNrMaxGap = ageIn - ageEnd;
 	}
-	nrFeed((const SInt16 *)sampleBuf, end);
+	if (ageEnd < ageIn || !mNrSync || mNrInPos == restart)
+		nrFeed((const SInt16 *)sampleBuf, end);
+	mNrSync = true;
 	for (UInt32 i = 0; i < numSampleFrames; i++) {
 		float v = mNrOut[(firstSampleFrame + i) % SOF_RING_FRAMES] * scale;
 		dst[2 * i] = v;
