@@ -977,19 +977,23 @@ bool VoodooHDASof::bootFirmware()
 	}
 
 	/*
-	 * VoodooHDA clears DEVC (0x78) bit 11 NSNPEN to force snooped DMA; Linux SOF leaves the
-	 * firmware value (NSNPEN=1 here). Give the DSP the firmware value for the boot window only;
-	 * VoodooHDA's value is put back in restoreDevc().
+	 * VoodooHDA clears DEVC (0x78) bit 11 NSNPEN to force snooped DMA. With NSNPEN=0 the ROM
+	 * pulls the first 32 KB and halts after the manifests (ROM_STATUS 80000003). The firmware
+	 * usually hands over NSNPEN=1 (Linux leaves it), but not always: on 2026-11-26 the same
+	 * machine started handing over 0. So set NSNPEN=1 for the boot window regardless of the
+	 * firmware value; VoodooHDA's value is put back in restoreDevc().
 	 */
 	mSavedDevc = mPci->configRead16(SOF_PCI_DEVC);
 	mDevcChanged = false;
-	if (mDev->mOrigPciCfgValid) {
-		UInt16 fwDevc = (UInt16)mDev->mOrigPciCfg[SOF_PCI_DEVC / 4];
-		UInt16 want = (UInt16)((mSavedDevc & ~SOF_PCI_DEVC_NSNPEN) | (fwDevc & SOF_PCI_DEVC_NSNPEN));
+	{
+		UInt16 want = (UInt16)(mSavedDevc | SOF_PCI_DEVC_NSNPEN);
+		if (mDev->mOrigPciCfgValid && !(mDev->mOrigPciCfg[SOF_PCI_DEVC / 4] & SOF_PCI_DEVC_NSNPEN))
+			SOFLOG("note: firmware left DEVC NSNPEN=0 (%04x), forcing 1 for the DSP boot",
+			       (unsigned)(UInt16)mDev->mOrigPciCfg[SOF_PCI_DEVC / 4]);
 		if (want != mSavedDevc) {
 			mPci->configWrite16(SOF_PCI_DEVC, want);
 			mDevcChanged = true;
-			SOFDBG("DEVC NSNPEN set to firmware value for DSP boot: %04x -> %04x", (unsigned)mSavedDevc,
+			SOFDBG("DEVC NSNPEN set for DSP boot: %04x -> %04x", (unsigned)mSavedDevc,
 			       (unsigned)mPci->configRead16(SOF_PCI_DEVC));
 		}
 	}
