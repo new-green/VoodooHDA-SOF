@@ -2,6 +2,16 @@
 
 **English** | [Türkçe](CHANGELOG.tr.md)
 
+## 3.6.9-sof2 (2026-11-28), experimental
+
+### Fixed
+- **DSP boot failed on some cold boots** (`ROM halted`, `ROM_STATUS 80000003`): the ROM needs DEVC (0x78) bit 11 NSNPEN set while it loads the firmware. The kext used to restore the value the firmware/BIOS left there, but on the test machine that value changed from 1 to 0, so the microphone disappeared. NSNPEN is now set for the boot window regardless; a `note: firmware left DEVC NSNPEN=0` line shows when this happens.
+- **Noise-reduction device stuttered and crackled in some apps** (seen in Google Meet in Brave): browsers often restart their audio IO or read the same part of the buffer twice. The NR engine treated that as a jump, reset RNNoise and inserted a short silence. Each read is now checked against the DMA write position. Repeated reads get the already denoised audio, small gaps are denoised as well, and only a real big jump skips ahead (with a pre-roll, no reset). The stop log shows the skip and re-read counters.
+
+### Changed
+- The firmware download is retried up to 3 times if the ROM halts.
+- The code-loader and ICCMAX DMA buffers are allocated below 4 GB.
+
 ## 3.6.9-sof1 (2026-11-25), experimental
 
 The first public version of the Intel SOF DMIC support. It is based on VoodooHDA Release368. Tested only on an HP ProBook 440 G9 (Alder Lake-P, 8086:51C8) with macOS Tahoe 26.7.
